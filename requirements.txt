@@ -11,3 +11,4 @@ coverage
 graphviz 
 matplotlib
 plotly
+streamlit-plotly-events==0.0.6
