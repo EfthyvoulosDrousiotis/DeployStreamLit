@@ -1,0 +1,14 @@
+sympy
+numpy
+scipy
+scikit-learn
+pandas
+mpi4py
+smccomponents @ git+https://github.com/UoL-SignalProcessingGroup/SMCComponents@9649e9c
+tqdm
+flake8
+pytest
+pytest-mpi
+pytest-cov
+coverage
+streamlit

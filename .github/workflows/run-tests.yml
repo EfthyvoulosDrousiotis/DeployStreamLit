@@ -1,0 +1,55 @@
+# This workflow will install Python dependencies, run tests and lint with a single version of Python
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+
+name: Run tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - 'main'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+    - uses: actions/checkout@v2
+      with:
+        submodules: recursive
+    - name: Set up MPI
+      uses: mpi4py/setup-mpi@v1
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+        cache: 'pip' # caching pip dependencies
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e .
+    - name: Run tests
+      run: |
+        pytest --cov=discretesampling -svx tests/
+    - name: Get number of CPU cores
+      uses: SimenB/github-actions-cpu-cores@v1
+      id: cpu-cores
+    - name: Run MPI tests with 2 cores
+      if: ${{ steps.cpu-cores.outputs.count }} > 1
+      continue-on-error: true
+      run: |
+        mpiexec -n 2 pytest --cov-append --cov=discretesampling -svx tests --only-mpi;
+    - name: Run MPI tests with 4 cores
+      if: ${{ steps.cpu-cores.outputs.count }} > 3
+      continue-on-error: true
+      run: |
+        mpiexec -n 4 pytest --cov-append --cov=discretesampling -svx tests --only-mpi;
+    - name: Coverage report
+      run: |
+        coverage report;
+
