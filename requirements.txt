@@ -1,0 +1,9 @@
+sympy
+numpy
+scipy
+scikit-learn
+pandas
+tqdm
+flake8
+coverage
+streamlit
