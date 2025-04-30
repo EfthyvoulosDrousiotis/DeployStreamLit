@@ -7,3 +7,4 @@ tqdm
 flake8
 coverage
 streamlit
+graphviz 
