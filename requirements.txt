@@ -3,7 +3,6 @@ numpy
 scipy
 scikit-learn
 pandas
-mpi4py
 smccomponents @ git+https://github.com/UoL-SignalProcessingGroup/SMCComponents@9649e9c
 tqdm
 flake8
