@@ -20,11 +20,49 @@ import numpy as np
 
 
 
-df = pd.read_csv(r"C:\Users\avarsi88\PycharmProjects\Parallel_SMC_sampler_Discrete_Variables\examples\datasets_smc_mcmc_CART\LiverDisorder.csv")
+df = pd.read_csv(r"C:\Users\efthi\Downloads\RemoteWorkData_final.csv")
+
+
+def infer_and_convert_types(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given a DataFrame where many columns are object dtype,
+    strip whitespace, coerce common missing markers to NaN,
+    then infer & convert each column to int or float where possible.
+    """
+    # 1) Strip whitespace from strings
+    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    
+    # 2) Replace blank strings or '?' with NaN
+    df = df.replace({'': np.nan, '?': np.nan})
+    
+    # 3) For each object column, try to convert to numeric
+    for col in df.columns:
+        if df[col].dtype == object:
+            # Attempt numeric conversion (floats or ints)
+            converted = pd.to_numeric(df[col], errors='coerce')
+            mask = df[col].notna()  # where original had something
+            
+            # If every non-null original is now numeric
+            if converted[mask].notna().all():
+                # Check if all (non-na) values are whole numbers
+                non_na = converted.dropna()
+                if (non_na % 1 == 0).all():
+                    # Use pandas’ nullable integer dtype
+                    df[col] = converted.astype("Int64")
+                else:
+                    df[col] = converted
+            # else: leave df[col] as object
+    
+    return df
+
+
+df = infer_and_convert_types(df)
+
+
 
 df = df.dropna()
-y = df.Target
-X = df.drop(['Target'], axis=1)
+y = df.HighLowSatisfactio
+X = df.drop(["HighLowSatisfactio"], axis=1)
 X = X.to_numpy()
 y = y.to_numpy()
 
@@ -39,7 +77,7 @@ for i in range(1):
     initialProposal = dt.TreeInitialProposal(X_train, y_train)
     dtSMC = DiscreteVariableSMC(dt.Tree, target, initialProposal)
     try:
-        treeSMCSamples, current_possibilities_for_predictions, logweights = dtSMC.sample(10, 5, a, resampling= "systematic")#residual,#systematic, knapsack, min_error, variational, min_error_imp, CIR
+        treeSMCSamples, current_possibilities_for_predictions, logweights = dtSMC.sample(10, 5, a, resampling= "residual")#residual,#systematic, knapsack, min_error, variational, min_error_imp, CIR
         #(100number of iterations,25number of trees)
         smcLabels, prob, leaf_prob, leaf_for_prediction = dt.stats(treeSMCSamples, X_test).predict(X_test, use_majority=True)
         
