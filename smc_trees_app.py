@@ -69,28 +69,70 @@ def visualize_tree(tree_data, feature_names):
     return dot
 
 def predict_from_tree(tree, input_features):
+    """
+    Walks the tree for a single input and returns (probabilities, path).
+    If any node or input is invalid, logs an error to Streamlit and returns ({}, path_so_far).
+    """
+    # Build a dict for quick node lookup
     nodes = {node["id"]: node for node in tree["nodes"]}
-    root = None
-    for node in tree["nodes"]:
-        if not node.get("is_leaf", False) and node.get("depth", -1) == 0:
-            root = node
-            break
+
+    # 1) Find the root (depth == 0, not a leaf)
+    root = next(
+        (n for n in tree["nodes"]
+         if not n.get("is_leaf", False) and n.get("depth", -1) == 0),
+        None
+    )
     if root is None:
-        st.error("No root node found in the tree.")
+        st.error("❌ No root node found in the tree JSON.")
         return {}, []
+
     path = [root["id"]]
     current = root
+
+    # 2) Traverse until you hit a leaf
     while not current.get("is_leaf", False):
-        feature_idx = current["feature"]
-        threshold = current["threshold"]
-        feature_value = input_features[feature_idx]
-        if feature_value <= threshold:
-            next_id = current["left"]
-        else:
-            next_id = current["right"]
+        # 2a) Validate node has 'feature' & 'threshold'
+        if "feature" not in current or "threshold" not in current:
+            st.error(f"❌ Node {current.get('id')} is missing 'feature' or 'threshold'.")
+            return {}, path
+
+        # 2b) Parse them safely
+        try:
+            feature_idx = int(current["feature"])
+            threshold = float(current["threshold"])
+        except (TypeError, ValueError):
+            st.error(f"❌ Invalid 'feature' or 'threshold' at node {current['id']}.")
+            return {}, path
+
+        # 2c) Bounds‐check the feature index
+        if feature_idx < 0 or feature_idx >= len(input_features):
+            st.error(
+                f"❌ Feature index {feature_idx} out of range "
+                f"(you have {len(input_features)} features)."
+            )
+            return {}, path
+
+        # 2d) Cast your input value to float
+        raw_val = input_features[feature_idx]
+        try:
+            feature_value = float(raw_val)
+        except (TypeError, ValueError):
+            st.error(f"❌ Invalid feature value for index {feature_idx}: {raw_val}")
+            return {}, path
+
+        # 2e) Decide branch
+        next_id = current["left"] if feature_value <= threshold else current["right"]
         path.append(next_id)
-        current = nodes[next_id]
-    return current["probabilities"], path
+
+        # 2f) Lookup the next node
+        current = nodes.get(next_id)
+        if current is None:
+            st.error(f"❌ Could not find node with id {next_id} in tree JSON.")
+            return {}, path
+
+    # 3) We’re at a leaf → return its probabilities
+    return current.get("probabilities", {}), path
+
 
 def visualize_tree_with_path(tree_data, feature_names, path):
     dot = graphviz.Digraph()
@@ -146,6 +188,42 @@ def build_label_to_tree_id():
     return mapping
 
 
+
+
+
+
+def infer_and_convert_types(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given a DataFrame where many columns are object dtype,
+    strip whitespace, coerce common missing markers to NaN,
+    then infer & convert each column to int or float where possible.
+    """
+    # 1) Strip whitespace from strings
+    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+
+    # 2) Replace blank strings or '?' with NaN
+    df = df.replace({'': np.nan, '?': np.nan})
+
+    # 3) For each object column, try to convert to numeric
+    for col in df.columns:
+        if df[col].dtype == object:
+            # Attempt numeric conversion (floats or ints)
+            converted = pd.to_numeric(df[col], errors='coerce')
+            mask = df[col].notna()  # where original had something
+
+            # If every non-null original is now numeric
+            if converted[mask].notna().all():
+                # Check if all (non-na) values are whole numbers
+                non_na = converted.dropna()
+                if (non_na % 1 == 0).all():
+                    # Use pandas’ nullable integer dtype
+                    df[col] = converted.astype("Int64")
+                else:
+                    df[col] = converted
+            # else: leave df[col] as object
+
+    return df
+
 # ----------------------
 # Build mapping for tree selection (for visualization tabs)
 # ----------------------
@@ -190,7 +268,7 @@ with tab0:
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
         df.replace("?", np.nan, inplace=True)
-        
+        df = infer_and_convert_types(df)
         st.write("Dataset Preview (first 10 rows):")
         st.dataframe(df.head(10))
         
@@ -225,6 +303,8 @@ with tab0:
                 st.dataframe(df_clean.head())
         else:
             df_clean = df
+            # After df_clean is defined:
+
         
         all_columns = list(df_clean.columns)
         target_column = st.selectbox("Select Target Column", all_columns)
