@@ -1,5 +1,5 @@
 import numpy as np
-from filtering.base.algorithms.smc_components.importance_resampling_version3 import systematic_resampling
+from discretesampling.base.algorithms.smc_components.importance_resampling_version3 import systematic_resampling
 # from filtering.base.algorithms.smc_components.resampling import systematic_resampling
 
 def residual_resampling(x, w, mvrs_rng , N=None):
