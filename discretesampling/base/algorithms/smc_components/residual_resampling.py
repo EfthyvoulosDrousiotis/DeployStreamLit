@@ -1,5 +1,6 @@
 import numpy as np
-from discretesampling.base.algorithms.smc_components.importance_resampling_version3 import systematic_resampling
+from filtering.base.algorithms.smc_components.importance_resampling_version3 import systematic_resampling
+# from filtering.base.algorithms.smc_components.resampling import systematic_resampling
 
 def residual_resampling(x, w, mvrs_rng , N=None):
 
@@ -13,7 +14,7 @@ def residual_resampling(x, w, mvrs_rng , N=None):
         w = w / np.sum(w)
 
     nd = np.floor(N * w).astype(int)  # nd(i) copies of x(i) to the new distribution
-    urw = w - nd  # unnormalised residual weights
+    urw = N*w - nd  # unnormalised residual weights
     nw = urw / np.sum(urw)  # normalised weights
 
     # i = 0
@@ -30,11 +31,8 @@ def residual_resampling(x, w, mvrs_rng , N=None):
     Nnd = np.sum(nd)  # number of deterministic samples
     Nr = N - Nnd  # number of residual samples
 
-    #xr, _, _ = systematic_resampling(x, nw, mvrs_rng, Nr)
-    
-    
-    xr, logWeights,_ = systematic_resampling(
-        x, nw, mvrs_rng, N)
+    xr, _, _ = systematic_resampling(x, nw, mvrs_rng, Nr)
+    # xr, _ = systematic_resampling(x, np.log(nw), np.log(w), mvrs_rng, parallel=False)
 
     # x_new[Nnd:] = xr[ :Nr]
     x_new.extend(xr)
