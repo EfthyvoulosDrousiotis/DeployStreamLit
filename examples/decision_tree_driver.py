@@ -60,7 +60,7 @@ def save_tree_to_json(tree, leaf_probs, accuracy, tree_id):
             "num_nodes": len(tree.tree),
             "num_leaves": len(tree.leafs),
             "max_depth": int(max_depth),
-            "accuracy": float(accuracy)
+            "accuracy": float(accuracy) / 100 if accuracy > 1 else float(accuracy)
         }
     }
     with open(os.path.join(MODELS_DIR, f"tree_{tree_id}.json"), "w") as f:
@@ -137,7 +137,7 @@ def train_smc_model(csv_path, target_column, tree_size, num_iterations, num_tree
             print("Could not compute feature importance:", e)
         
         # ✅ THEN return
-        return smcAccuracy
+        return smcAccuracy / 100 if smcAccuracy > 1 else smcAccuracy
     except ZeroDivisionError:
         print("SMC sampling failed due to division by zero")
         return None
