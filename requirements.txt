@@ -1,4 +1,5 @@
 streamlit==1.44.0
+mpi4py
 sympy
 numpy
 scipy
