@@ -49,6 +49,69 @@ def get_valid_tree_files():
                 st.write(f"Skipping {filename} due to error: {e}")
     return valid_files
 
+import pandas as pd
+import json
+import numpy as np
+from pathlib import Path
+
+import pandas as pd, numpy as np, json
+from pathlib import Path
+
+def encode_categoricals(df: pd.DataFrame,
+                        save_path: str = "categorical_encodings.json"):
+    """
+    • Converts object columns that are fully numeric (even if stored as str)
+      → numeric dtype (Int64 or float64).
+    • Converts remaining non-numeric object columns → categorical integer codes.
+    • Returns (encoded_df, mapping_dict).  Mapping only for categorical columns.
+    """
+    enc_map  = {}            # {column: {original_label: int_code}}
+    df_enc   = df.copy()
+
+    for col in df.columns:
+        if not pd.api.types.is_object_dtype(df[col]):
+            # already numeric, boolean, datetime, etc.
+            continue
+
+        # Clean: strip whitespace, turn "" and '?' into NaN
+        ser = (df[col]
+               .astype(str)
+               .str.strip()
+               .replace({"": np.nan, "nan": np.nan, "?": np.nan}))
+
+        # Try numeric conversion
+        numeric_try = pd.to_numeric(ser, errors="coerce")
+
+        all_numeric = numeric_try.notna().sum() == ser.notna().sum()
+
+        if all_numeric:
+            # Pure numeric column masquerading as strings
+            if (numeric_try.dropna() % 1 == 0).all():
+                # All whole numbers → nullable Int64
+                df_enc[col] = numeric_try.astype("Int64")
+            else:
+                df_enc[col] = numeric_try.astype(float)
+        else:
+            # Genuine categorical column → factorize
+            codes, labels = pd.factorize(ser, sort=True)
+            # Replace -1 (pd.factorize NaN marker) with pd.NA before casting
+            codes_ser = pd.Series(codes).replace({-1: pd.NA})
+            df_enc[col] = codes_ser.astype("Int64")
+
+            enc_map[col] = {str(label): int(code)
+                            for code, label in enumerate(labels)}
+
+    # Persist mapping for later prediction use
+    if enc_map:   # only write file if there is at least one categorical
+        Path(save_path).write_text(json.dumps(enc_map, indent=2))
+
+    return df_enc, enc_map
+
+
+
+
+
+
 def visualize_tree(tree_data, feature_names):
     dot = graphviz.Digraph()
     for node in tree_data["nodes"]:
@@ -260,90 +323,116 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
 # Tab 0: Train SMC Model
 # ----------------------
 with tab0:
-    st.header("Train SMC Trees Model")
-    
-    # File uploader for CSV file
-    uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"], key="train_csv")
-    
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        df.replace("?", np.nan, inplace=True)
-        df = infer_and_convert_types(df)
-        st.write("Dataset Preview (first 10 rows):")
-        st.dataframe(df.head(10))
-        
-        missing_summary = df.isna().sum()
-        st.write("Missing Values Summary:")
-        st.write(missing_summary)
-        
-        if missing_summary.sum() > 0:
-            with st.expander("Missing Value Handling Options"):
-                cleaning_option = st.selectbox(
-                    "Handling Method", 
-                    ["Do Nothing", "Drop Rows", "Fill with Mean", "Fill with Median", "Fill with Specific Value"]
-                )
-                if cleaning_option == "Drop Rows":
-                    df_clean = df.dropna()
-                elif cleaning_option == "Fill with Mean":
-                    df_clean = df.copy()
-                    numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
-                    for col in numeric_cols:
-                        df_clean[col].fillna(df_clean[col].mean(), inplace=True)
-                elif cleaning_option == "Fill with Median":
-                    df_clean = df.copy()
-                    numeric_cols = df_clean.select_dtypes(include=[np.number]).columns
-                    for col in numeric_cols:
-                        df_clean[col].fillna(df_clean[col].median(), inplace=True)
-                elif cleaning_option == "Fill with Specific Value":
-                    specific_val = st.number_input("Enter the specific value to fill missing values", value=0.0)
-                    df_clean = df.fillna(specific_val)
-                else:
-                    df_clean = df
-                st.write("Cleaned Dataset Preview (first 10 rows):")
-                st.dataframe(df_clean.head())
-        else:
-            df_clean = df
-            # After df_clean is defined:
+    st.header("💪 Train SMC Trees Model")
 
-        
-        all_columns = list(df_clean.columns)
-        target_column = st.selectbox("Select Target Column", all_columns)
-        feature_columns = [col for col in all_columns if col != target_column]
-        st.write("Features used for training:", feature_columns)
-        
-        # Save only the predictor (feature) names for later use
+    uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"], key="train_csv")
+
+    if uploaded_file is not None:
+        # Read everything as string first so we can clean universally
+        df_raw = pd.read_csv(uploaded_file, dtype=str)
+        st.write("Dataset preview (first 10 rows):")
+        st.dataframe(df_raw.head(10), use_container_width=True)
+
+        # ── Missing-value summary
+        st.subheader("Missing value summary")
+        missing_summary = df_raw.replace({"": np.nan}).isna().sum()
+        st.dataframe(missing_summary.to_frame("Missing"), use_container_width=True)
+
+        # ── Optional: user-chosen cleaning for missing values
+        if missing_summary.sum() > 0:
+            with st.expander("🧹 Handle missing values"):
+                choice = st.selectbox(
+                    "Choose strategy",
+                    ["Drop rows", "Fill with column mean", "Fill with column median", "Fill with specific value", "Leave as-is"],
+                )
+                if choice == "Drop rows":
+                    df_clean = df_raw.replace({"": np.nan}).dropna()
+                elif choice == "Fill with column mean":
+                    df_tmp = df_raw.replace({"": np.nan})
+                    df_tmp = df_tmp.apply(pd.to_numeric, errors="ignore")
+                    df_clean = df_tmp.fillna(df_tmp.mean(numeric_only=True))
+                elif choice == "Fill with column median":
+                    df_tmp = df_raw.replace({"": np.nan})
+                    df_tmp = df_tmp.apply(pd.to_numeric, errors="ignore")
+                    df_clean = df_tmp.fillna(df_tmp.median(numeric_only=True))
+                elif choice == "Fill with specific value":
+                    val = st.number_input("Value to fill", value=0.0)
+                    df_clean = df_raw.replace({"": np.nan}).fillna(val)
+                else:
+                    df_clean = df_raw.copy()
+        else:
+            df_clean = df_raw.copy()
+
+        # ── 2️⃣  Encode categoricals automatically
+        df_clean, enc_map = encode_categoricals(df_clean)
+        if enc_map:
+            st.success("Categorical columns auto-encoded.")
+            enc_df = (
+                pd.DataFrame(
+                    [(col, orig, code) for col, m in enc_map.items() for orig, code in m.items()],
+                    columns=["Feature", "Original label", "Encoded as"],
+                )
+                .sort_values(["Feature", "Encoded as"])
+            )
+            with st.expander("🔑 Encoding map"):
+                st.dataframe(enc_df, use_container_width=True)
+        else:
+            st.info("No categorical columns detected.")
+
+        # ── 3️⃣  Select target & define feature list
+        all_cols = list(df_clean.columns)
+        target_column = st.selectbox("Select target column", all_cols)
+        feature_columns = [c for c in all_cols if c != target_column]
+        st.write("**Features used:**", feature_columns)
+
+        # Save feature names for downstream tabs
         with open("feature_names.json", "w") as f:
             json.dump(feature_columns, f, indent=2)
-        
-        st.subheader("SMC Training Parameters")
-        tree_size = st.number_input("Tree Size (a)", min_value=1, value=10, step=1, help="Size of the tree.")
-        num_iterations = st.number_input("Number of Iterations", min_value=1, value=10, step=1, help="Positive integer for iterations.")
-        num_trees = st.number_input("Number of Trees", min_value=1, value=5, step=1, help="Positive integer for number of trees.")
-        resampling_options = ["residual", "systematic", "knapsack", "min_error", "variational", "min_error_imp", "CIR"]
-        resampling_scheme = st.selectbox("Resampling Scheme", resampling_options)
-        
-        # Save the cleaned dataset to a temporary path for training
+
+        # ── 4️⃣  Training parameters
+        st.subheader("SMC parameters")
+        tree_size       = st.number_input("Tree size (a)",          min_value=1, value=10, step=1)
+        num_iterations  = st.number_input("Number of iterations",   min_value=1, value=10, step=1)
+        num_trees       = st.number_input("Number of trees",        min_value=1, value=5,  step=1)
+        resampling_opts = ["residual", "systematic", "knapsack", "min_error", "variational", "min_error_imp", "CIR"]
+        resampling_scheme = st.selectbox("Resampling scheme", resampling_opts)
+
+        # ── 5️⃣  Persist cleaned CSV for driver
         csv_path = f"datasets/{uploaded_file.name}"
         os.makedirs("datasets", exist_ok=True)
         df_clean.to_csv(csv_path, index=False)
-        
-        if st.button("Train SMC Model"):
-            # Clear previous tree JSON files in the MODELS_DIR
-            for filename in os.listdir(MODELS_DIR):
-                if filename.startswith("tree_") and filename.endswith(".json"):
-                    os.remove(os.path.join(MODELS_DIR, filename))
-        
-            with st.spinner("Training in progress..."):
-                accuracy = train_smc_model(csv_path, target_column, tree_size, num_iterations, num_trees, resampling_scheme)
+
+        # ── 6️⃣  Train button
+        if st.button("🚀 Train SMC Model"):
+            # Clear old trees
+            for f in os.listdir(MODELS_DIR):
+                if f.startswith("tree_") and f.endswith(".json"):
+                    os.remove(os.path.join(MODELS_DIR, f))
+
+            with st.spinner("Training, please wait…"):
+                accuracy = train_smc_model(
+                    csv_path,
+                    target_column,
+                    tree_size,
+                    num_iterations,
+                    num_trees,
+                    resampling_scheme,
+                )
+
             if accuracy is not None:
-                st.success(f"SMC Training complete. Ensemble Accuracy: {accuracy:.2%}")
-                X_train, X_test, y_train, y_test = train_test_split(df_clean[feature_columns], df_clean[target_column], test_size=0.30, random_state=42)
-                st.session_state["X_test"] = X_test.to_numpy()
-                st.session_state["y_test"] = y_test.to_numpy()
+                st.success(f"Training done. Ensemble accuracy: {accuracy:.2%}")
+                # Split and stash test arrays for later tabs
+                X = df_clean[feature_columns].to_numpy()
+                y = df_clean[target_column].to_numpy()
+                from sklearn.model_selection import train_test_split
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=0.30, random_state=42
+                )
+                st.session_state["X_test"] = X_test
+                st.session_state["y_test"] = y_test
                 st.cache_data.clear()
-                st.write("SMC trees saved in the 'models' folder and test data stored for evaluation.")
             else:
-                st.error("SMC training failed.")
+                st.error("Training failed. Check the console logs.")
 
 
 
@@ -409,23 +498,164 @@ with tab2:
             tree_viz2 = visualize_tree(tree_data2, load_feature_names())
             st.graphviz_chart(tree_viz2)
 
+# ─── required import ───────────────────────────────────────────────
+from collections import defaultdict
+# ───────────────────────────────────────────────────────────────────
+
+
 # ----------------------
-# Tab 3: Feature Importance
+# Tab 3 • Feature Importance  +  Row-Weighted Consensus Tree
 # ----------------------
 with tab3:
-    st.header("Feature Importance across all SMC Trees")
-    with open("feature_importance.json", "r") as f:
-        importance_dict = json.load(f)
-    sorted_features = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)
-    features, importances = zip(*sorted_features)
-    fig, ax = plt.subplots(figsize=(8, max(4, len(features)*0.4)))
-    ax.barh(features[::-1], [imp*100 for imp in importances[::-1]], color="skyblue")
-    ax.set_xlabel("Feature Importance (%)")
-    ax.set_title("Feature Importance based on Frequency of Usage")
-    plt.tight_layout()
+    st.header("📊 Feature Importance & Consensus Tree")
+
+    # 1️⃣  Pick importance metric
+    metric_choice = st.radio(
+        "Importance metric",
+        ("Split frequency", "Rows handled"),
+        horizontal=True,
+        index=0,
+    )
+    file_map = {
+        "Split frequency": "feature_importance_split.json",
+        "Rows handled":    "feature_importance_rows.json",
+    }
+    imp_file = file_map[metric_choice]
+
+    if not os.path.exists(imp_file):
+        st.error(f"File '{imp_file}' not found. Train the model first.")
+        st.stop()
+
+    with open(imp_file, "r") as f:
+        imp_dict = json.load(f)
+
+    # ── Bar chart & table
+    items = sorted(imp_dict.items(), key=lambda x: x[1], reverse=True)
+    feats, imps = zip(*items)
+    fig, ax = plt.subplots(figsize=(8, max(4, len(feats) * 0.4)))
+    ax.barh(feats[::-1], [v * 100 for v in imps[::-1]], color="skyblue")
+    ax.set_xlabel("Importance (%)")
+    ax.set_title(f"Feature importance • {metric_choice}")
     st.pyplot(fig)
-    st.subheader("Importance Values")
-    st.dataframe({"Feature": features, "Importance (%)": [round(imp*100,2) for imp in importances]}, use_container_width=True)  
+    st.dataframe(
+        {"Feature": feats, "Importance (%)": [round(v * 100, 2) for v in imps]},
+        use_container_width=True,
+    )
+
+    # 2️⃣  Consensus tree prerequisites
+    if "X_test" not in st.session_state or "y_test" not in st.session_state:
+        st.info("Train a model first to build the consensus tree.")
+        st.stop()
+
+    X_test = st.session_state["X_test"]
+    y_test = st.session_state["y_test"]
+    feature_names = load_feature_names()
+    max_depth = st.slider("Consensus-tree max depth", 1, 6, 3)
+
+    # ── Build cached consensus tree (row-weighted option-B)
+    @st.cache_data(show_spinner=False)
+    def build_consensus(depth_cap):
+        tree_files = [f for f in os.listdir(MODELS_DIR) if f.startswith("tree_")]
+        ensemble   = [load_tree(int(f.split("_")[1].split(".")[0])) for f in tree_files]
+
+        def best_split(mask, depth_level):
+            counts = defaultdict(int)
+            for t in ensemble:
+                nodes = {n["id"]: n for n in t["nodes"]}
+                root  = next(n for n in t["nodes"]
+                             if not n["is_leaf"] and n.get("depth", -1) == 0)
+                stack = [(root, mask)]
+                while stack:
+                    node, m = stack.pop()
+                    if node.get("depth", -1) != depth_level or node["is_leaf"]:
+                        if not node["is_leaf"]:
+                            for cid, cond in (
+                                (node["left"],  lambda v: v <= node["threshold"]),
+                                (node["right"], lambda v: v >  node["threshold"]),
+                            ):
+                                child = nodes.get(cid)
+                                if child is not None and m.any():
+                                    new_mask = m & cond(X_test[:, node["feature"]])
+                                    if new_mask.any():
+                                        stack.append((child, new_mask))
+                        continue
+                    key = (node["feature"], node["threshold"])
+                    counts[key] += int(m.sum())
+            return max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
+
+        def recurse(mask, depth):
+            uni = np.unique(y_test[mask])
+            # stop criteria
+            if depth >= depth_cap or len(uni) == 1:
+                pred = uni[0] if len(uni) == 1 else uni[np.argmax(
+                    [(y_test[mask] == c).sum() for c in uni])]
+                return {"leaf": True, "class": str(pred)}
+
+            split = best_split(mask, depth)
+            if split is None:
+                pred = uni[np.argmax([(y_test[mask] == c).sum() for c in uni])]
+                return {"leaf": True, "class": str(pred)}
+
+            feat, thr = split
+            left_mask  = mask & (X_test[:, feat] <= thr)
+            right_mask = mask & (X_test[:, feat] >  thr)
+            if not left_mask.any() or not right_mask.any():
+                pred = uni[np.argmax([(y_test[mask] == c).sum() for c in uni])]
+                return {"leaf": True, "class": str(pred)}
+
+            return {
+                "feature": int(feat),
+                "threshold": float(thr),
+                "left":  recurse(left_mask,  depth + 1),
+                "right": recurse(right_mask, depth + 1),
+            }
+
+        tree_dict = recurse(np.ones(len(X_test), dtype=bool), 0)
+
+        # predict with built tree
+        def predict_one(row, node):
+            while not node.get("leaf", False):
+                node = node["left"] if row[node["feature"]] <= node["threshold"] else node["right"]
+            return node["class"]
+
+        preds = np.array([predict_one(r, tree_dict) for r in X_test], dtype=str)
+        acc   = np.mean(preds == y_test.astype(str))     # compare as strings
+        
+        def count_leaves(node):
+            return 1 if node.get("leaf", False) else \
+                   count_leaves(node["left"]) + count_leaves(node["right"])
+        st.write(f"Depth cap {depth_cap} → leaves {count_leaves(tree_dict)}")
+        
+        
+        
+        return tree_dict, acc
+
+    tree_dict, cons_acc = build_consensus(max_depth)
+
+    # 3️⃣  Graphviz render + accuracy
+    def to_dot(node, idx=[0], lines=None):
+        if lines is None:
+            lines = ["digraph G{", "node [shape=box, style=rounded]"]
+        this = idx[0]; idx[0] += 1
+        if node.get("leaf", False):
+            lines.append(f'{this} [label="class = {node["class"]}", shape=oval, fillcolor=lightgreen, style=filled];')
+        else:
+            lab = f'{feature_names[node["feature"]]} ≤ {node["threshold"]:.2f}'
+            lines.append(f'{this} [label="{lab}", fillcolor=lightblue];')
+            l_id = idx[0]; to_dot(node["left"], idx, lines)
+            lines.append(f"{this} -> {l_id} [label=True];")
+            r_id = idx[0]; to_dot(node["right"], idx, lines)
+            lines.append(f"{this} -> {r_id} [label=False];")
+        if this == 0:
+            lines.append("}")
+            return "\n".join(lines)
+
+    st.graphviz_chart(to_dot(tree_dict))
+    st.success(f"Consensus-tree accuracy on test set: **{cons_acc:.2%}**")
+
+
+
+
 
 # ----------------------
 # Tab 4: Interactive Prediction (Exclude "Target")
