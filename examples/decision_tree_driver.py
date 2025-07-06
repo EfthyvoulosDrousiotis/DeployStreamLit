@@ -2,160 +2,237 @@
 # -*- coding: utf-8 -*-
 """
 Created on Fri Nov  5 14:28:12 2021
-
 @author: efthi
 """
-import copy
+import os
 import sys
 import json
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 from sklearn.model_selection import train_test_split
 from discretesampling.domain import decision_tree as dt
 from discretesampling.base.algorithms import DiscreteVariableSMC
 import streamlit as st
-import os
 
-
+# ------------------------------------------------------------------#
+#  Constants & helpers
+# ------------------------------------------------------------------#
 MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-
+# ------------------------------------------------------------------#
+#  JSON saving utilities
+# ------------------------------------------------------------------#
 def save_tree_to_json(tree, leaf_probs, accuracy, tree_id):
+    """Serialize one tree into models/tree_{id}.json"""
     nodes_json = []
-    leaf_set = set(int(leaf) for leaf in tree.leafs)
-    leaf_id_to_index = {int(leaf): idx for idx, leaf in enumerate(tree.leafs)}
 
-    # Save internal nodes
+    # internal nodes
     for node in tree.tree:
         node_id, left_id, right_id, feature, threshold, depth = node
-        node_json = {
-            "id": int(node_id),
-            "left": int(left_id),
-            "right": int(right_id),
-            "feature": int(feature),
-            "threshold": float(threshold),
-            "depth": int(depth),
-            "is_leaf": False
-        }
-        nodes_json.append(node_json)
+        nodes_json.append(
+            {
+                "id": int(node_id),
+                "left": int(left_id),
+                "right": int(right_id),
+                "feature": int(feature),
+                "threshold": float(threshold),
+                "depth": int(depth),
+                "is_leaf": False,
+            }
+        )
 
-    # Save leaf nodes with probabilities
+    # leaf nodes
+    leaf_id_to_index = {int(leaf): idx for idx, leaf in enumerate(tree.leafs)}
     for leaf_id in tree.leafs:
-        leaf_idx = tree.leafs.index(leaf_id)
         probs = leaf_probs[leaf_id_to_index[int(leaf_id)]]
         probs_dict = {str(cls): float(prob) for cls, prob in probs.items()}
-        leaf_json = {
-            "id": int(leaf_id),
-            "is_leaf": True,
-            "probabilities": probs_dict
-        }
-        nodes_json.append(leaf_json)
+        nodes_json.append(
+            {"id": int(leaf_id), "is_leaf": True, "probabilities": probs_dict}
+        )
 
     max_depth = max(node[5] for node in tree.tree)
     tree_data = {
         "nodes": nodes_json,
-        "leafs": [int(leaf) for leaf in tree.leafs],
+        "leafs": [int(l) for l in tree.leafs],
         "stats": {
             "num_nodes": len(tree.tree),
             "num_leaves": len(tree.leafs),
             "max_depth": int(max_depth),
-            "accuracy": float(accuracy) / 100 if accuracy > 1 else float(accuracy)
-        }
+            "accuracy": float(accuracy) / 100 if accuracy > 1 else float(accuracy),
+        },
     }
+
     with open(os.path.join(MODELS_DIR, f"tree_{tree_id}.json"), "w") as f:
         json.dump(tree_data, f, indent=4)
 
-def train_smc_model(csv_path, target_column, tree_size, num_iterations, num_trees, resampling_scheme, random_state=42):
+# ------------------------------------------------------------------#
+#  NEW: row-weighted feature-importance
+# ------------------------------------------------------------------#
+def feature_importance_by_data(trees, X_train, verbose=False):
     """
-    Trains SMC trees on the dataset at csv_path, using the specified target_column.
-    Returns ensemble accuracy.
-    Saves each tree as a JSON file (tree_0.json, tree_1.json, ...).
+    Row-weighted feature importance.
+    Skips any child IDs not present in `tree.tree`.
+    """
+    n_samples, _ = X_train.shape
+    counts = defaultdict(int)
+
+    for t_idx, tree in enumerate(trees):
+        # map id -> node tuple
+        nodes = {n[0]: n for n in tree.tree}
+
+        try:
+            root_id = next(n_id for n_id, *rest in tree.tree if rest[-1] == 0)
+        except StopIteration:
+            if verbose:
+                print(f"⚠️ Tree {t_idx}: no root (depth == 0). Skipping.")
+            continue
+
+        stack = [(root_id, np.ones(n_samples, dtype=bool))]
+
+        while stack:
+            node_id, mask = stack.pop()
+            node = nodes.get(node_id)
+
+            # orphan check
+            if node is None:
+                if verbose:
+                    print(f"⚠️ Tree {t_idx}: orphan node id {node_id}.")
+                continue
+
+            _, left_id, right_id, feat_idx, thresh, _ = node
+            if feat_idx < 0:  # leaf
+                continue
+
+            counts[feat_idx] += mask.sum()
+            col_vals = X_train[:, feat_idx]
+
+            left_mask  = mask & (col_vals <= thresh)
+            right_mask = mask & (col_vals >  thresh)
+
+            # Only push children that exist **and** receive rows
+            if left_mask.any() and left_id in nodes:
+                stack.append((left_id, left_mask))
+            if right_mask.any() and right_id in nodes:
+                stack.append((right_id, right_mask))
+
+    total = sum(counts.values()) or 1
+    return {f: c / total for f, c in counts.items()}
+
+
+# ------------------------------------------------------------------#
+#  Training driver
+# ------------------------------------------------------------------#
+def train_smc_model(
+    csv_path,
+    target_column,
+    tree_size,
+    num_iterations,
+    num_trees,
+    resampling_scheme,
+    random_state=42,
+):
+    """
+    Train an SMC ensemble and save:
+      • tree_*.json in models/
+      • feature_importance_split.json
+      • feature_importance_rows.json
+    Returns mean ensemble accuracy.
     """
     df = pd.read_csv(csv_path)
     df = df.dropna()
-    # Separate target and features
+
+    # ---- split X / y
     y = df[target_column].to_numpy()
-    feature_columns = [col for col in df.columns if col != target_column]
+    feature_columns = [c for c in df.columns if c != target_column]
     X = df[feature_columns].to_numpy()
-    
-    # Split into train/test
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.30, random_state=random_state)
-    # Then, after training and computing the SMC trees:
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.30, random_state=random_state
+    )
+
+    # expose test data to Streamlit
     st.session_state["X_test"] = X_test
     st.session_state["y_test"] = y_test
+
     a = int(tree_size)
     target = dt.TreeTarget(a)
     initialProposal = dt.TreeInitialProposal(X_train, y_train)
     dtSMC = DiscreteVariableSMC(dt.Tree, target, initialProposal)
-    
+
     try:
-        # Sample SMC trees
-        treeSMCSamples, current_possibilities_for_predictions, logweights = dtSMC.sample(
+        tree_samples, leaf_probs_list, _ = dtSMC.sample(
             int(num_iterations), int(num_trees), a, resampling=resampling_scheme
         )
-        # Predict using majority vote
-        smcLabels, prob, leaf_prob, leaf_for_prediction = dt.stats(treeSMCSamples, X_test).predict(
+
+        # majority-vote ensemble accuracy
+        smcLabels, _, _, _ = dt.stats(tree_samples, X_test).predict(
             X_test, use_majority=True
         )
-        smcAccuracy = dt.accuracy(y_test, smcLabels)
-        print("SMC mean accuracy: ", smcAccuracy)
-        
-        # Also compute per-tree accuracies for saving
-        smcLabel_per_tree = dt.stats(treeSMCSamples, X_test).predict(X_test, use_majority=False)
-        acc_per_tree = [dt.accuracy(y_test, label) for label in smcLabel_per_tree]
-        
-        # Save each tree to JSON
-        for idx, (tree_sample, leaf_probs_sample, acc_val) in enumerate(zip(treeSMCSamples, current_possibilities_for_predictions, acc_per_tree)):
-            save_tree_to_json(tree_sample, leaf_probs_sample, acc_val, idx)
-            
-            
-        
-        
-        # ✅ Move feature importance saving HERE
-        try:
-            all_features = [col for col in df.columns if col != target_column]
-            feature_usage = {i: 0 for i in range(len(all_features))}
-            print("I am computing feature importance")
-        
-            for tree in treeSMCSamples:
-                for node in tree.tree:
-                    _, _, _, feature_idx, _, _ = node
-                    if feature_idx >= 0:
-                        feature_usage[feature_idx] += 1
-        
-            total_usage = sum(feature_usage.values())
-            importance = {
-                all_features[i]: (feature_usage[i] / total_usage) if total_usage > 0 else 0
-                for i in feature_usage
-            }
-        
-            with open("feature_importance.json", "w") as f:
-                json.dump(importance, f, indent=2)
-            print("Feature importance saved.")
-        except Exception as e:
-            print("Could not compute feature importance:", e)
-        
-        # ✅ THEN return
-        return smcAccuracy / 100 if smcAccuracy > 1 else smcAccuracy
-    except ZeroDivisionError:
-        print("SMC sampling failed due to division by zero")
-        return None
-    
-   
+        ensemble_acc = dt.accuracy(y_test, smcLabels)
+        print("SMC ensemble accuracy:", ensemble_acc)
 
-# For command-line usage, you could add:
+        # per-tree accuracy + save JSONs
+        per_tree_labels = dt.stats(tree_samples, X_test).predict(
+            X_test, use_majority=False
+        )
+        per_tree_acc = [
+            dt.accuracy(y_test, lbl) for lbl in per_tree_labels
+        ]
+        for idx, (tree, lp, acc) in enumerate(
+            zip(tree_samples, leaf_probs_list, per_tree_acc)
+        ):
+            save_tree_to_json(tree, lp, acc, idx)
+
+        # ------------------------------------------------------------------
+        # Compute BOTH importance metrics
+        # ------------------------------------------------------------------
+        # A) Split-count (how many times feature appears)
+        split_counts = defaultdict(int)
+        for tree in tree_samples:
+            for node in tree.tree:
+                feat_idx = node[3]
+                if feat_idx >= 0:
+                    split_counts[feat_idx] += 1
+        total_splits = sum(split_counts.values()) or 1
+        importance_split = {
+            feature_columns[i]: split_counts.get(i, 0) / total_splits
+            for i in range(len(feature_columns))
+        }
+        with open("feature_importance_split.json", "w") as f:
+            json.dump(importance_split, f, indent=2)
+
+        # B) Row-weighted
+        importance_rows_raw = feature_importance_by_data(tree_samples, X_train, verbose=True)
+        importance_rows = {
+            feature_columns[i]: importance_rows_raw.get(i, 0.0)
+            for i in range(len(feature_columns))
+        }
+        with open("feature_importance_rows.json", "w") as f:
+            json.dump(importance_rows, f, indent=2)
+
+        print("Feature-importance files written.")
+
+        return ensemble_acc / 100 if ensemble_acc > 1 else ensemble_acc
+
+    except ZeroDivisionError:
+        print("SMC sampling failed (division by zero)")
+        return None
+
+# ------------------------------------------------------------------#
+#  CLI entry-point
+# ------------------------------------------------------------------#
 if __name__ == "__main__":
-    # Example usage: python decision_tree_driver.py datasets/LiverDisorder.csv Target 10 10 5 systematic
+    # Usage: python decision_tree_driver.py <csv> <target> <a> <iters> <trees> <resampling>
     if len(sys.argv) >= 7:
-        csv_path = sys.argv[1]
-        target_column = sys.argv[2]
-        tree_size = sys.argv[3]
-        num_iterations = sys.argv[4]
-        num_trees = sys.argv[5]
-        resampling_scheme = sys.argv[6]
-        accuracy = train_smc_model(csv_path, target_column, tree_size, num_iterations, num_trees, resampling_scheme)
-        if accuracy is not None:
-            print("Overall ensemble accuracy:", accuracy)
+        _, csv_path, target_column, a, iters, trees, scheme = sys.argv[:7]
+        acc = train_smc_model(csv_path, target_column, a, iters, trees, scheme)
+        if acc is not None:
+            print("Overall ensemble accuracy:", acc)
     else:
-        print("Usage: python decision_tree_driver.py <csv_path> <target_column> <tree_size> <num_iterations> <num_trees> <resampling_scheme>")
+        print(
+            "Usage: python decision_tree_driver.py "
+            "<csv_path> <target_column> <tree_size> <num_iterations> "
+            "<num_trees> <resampling_scheme>"
+        )
