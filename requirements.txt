@@ -12,4 +12,4 @@ graphviz
 matplotlib
 plotly
 streamlit-plotly-events==0.0.6
-statsmodels>=0.14.4,<0.15 
+statsmodels==0.14.0
