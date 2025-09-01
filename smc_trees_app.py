@@ -1130,67 +1130,156 @@ with tab8:
         st.info("Please upload a CSV file to create plots.")
 
 # --- Evaluation Metrics Tab ---
+# --- Evaluation Metrics Tab (ROC, AUC & Confusion Matrix) ---
 with tab9:
-    st.header("Evaluation Metrics (ROC & AUC)")
+    st.header("Evaluation Metrics (ROC, AUC & Confusion Matrix)")
 
-    # Check if test data is available in session state
+    # Must have cached test data
     if "X_test" not in st.session_state or "y_test" not in st.session_state:
         st.error("Test data not found. Please train the model first (Tab 0).")
+        st.stop()
+
+    X_test = st.session_state["X_test"]
+    y_test = st.session_state["y_test"]
+
+    # Build a fresh local mapping of trees for this tab
+    tree_files = get_valid_tree_files()
+    label_to_tree_id_eval = {}
+    for filename in sorted(tree_files):
+        try:
+            tid = int(filename.split("_")[1].split(".")[0])
+            data = load_tree(tid)
+            if not data:
+                continue
+            stats = data.get("stats", {})
+            acc = stats.get("accuracy", None)
+            acc_txt = f"{acc:.2%}" if isinstance(acc, (int, float)) else "n/a"
+            label = f"Tree {tid} | Nodes: {stats.get('num_nodes','?')} | Depth: {stats.get('max_depth','?')} | Acc: {acc_txt}"
+            label_to_tree_id_eval[label] = tid
+        except Exception:
+            continue
+
+    if not label_to_tree_id_eval:
+        st.error("No tree models found. Please train the model first in the 'Train SMC Model' tab.")
+        st.stop()
+
+    # Evaluation mode selection
+    eval_mode = st.radio("Prediction Mode", options=["Single Tree", "Ensemble"], horizontal=True, key="eval_mode")
+
+    # For binary ROC, align types to strings so '1' matches '1'
+    y_true_str = y_test.astype(str)
+    unique_classes = np.unique(y_true_str)
+    is_binary = len(unique_classes) == 2
+    # Choose the positive class consistently (the lexicographically larger label, typically "1")
+    pos_label_str = unique_classes[-1] if is_binary else None
+
+    y_scores = []              # probability for positive class (for ROC, binary only)
+    y_pred_labels_str = []     # predicted class labels (as strings) for confusion matrix
+
+    # Helper: argmax over a probability dict that may have string keys
+    def argmax_label(prob_dict: dict) -> str:
+        return max(prob_dict.items(), key=lambda kv: kv[1])[0] if prob_dict else "?"
+
+    if eval_mode == "Single Tree":
+        selected_label_eval = st.selectbox("Select Tree for Evaluation", list(label_to_tree_id_eval.keys()), key="eval_tree")
+        tree_id_eval = label_to_tree_id_eval[selected_label_eval]
+        tree_data_eval = load_tree(tree_id_eval)
+
+        for row in X_test:
+            pred_probs, _ = predict_from_tree(tree_data_eval, list(row))
+            y_pred_labels_str.append(argmax_label(pred_probs))
+            if is_binary:
+                y_scores.append(float(pred_probs.get(pos_label_str, 0.0)))
+
+    else:  # Ensemble
+        # Average probabilities (for ROC) and majority vote (for confusion matrix)
+        all_tree_ids = [label_to_tree_id_eval[k] for k in label_to_tree_id_eval.keys()]
+
+        for row in X_test:
+            per_tree_probs = []
+            votes = []
+            for tid in all_tree_ids:
+                td = load_tree(tid)
+                probs, _ = predict_from_tree(td, list(row))
+                per_tree_probs.append(probs)
+                votes.append(argmax_label(probs))
+
+            # Majority vote for predicted label
+            if votes:
+                majority = max(set(votes), key=votes.count)
+            else:
+                majority = "?"
+            y_pred_labels_str.append(majority)
+
+            # For ROC: average positive-class probability
+            if is_binary:
+                # collect per-tree prob for pos label
+                cls_probs = [float(p.get(pos_label_str, 0.0)) for p in per_tree_probs] if per_tree_probs else [0.0]
+                y_scores.append(float(np.mean(cls_probs)))
+
+    # ----- Confusion Matrix -----
+    st.subheader("Confusion Matrix")
+
+    # Establish consistent label order (union of true and predicted)
+    labels_all = sorted(np.unique(np.concatenate([unique_classes, np.array(y_pred_labels_str, dtype=str)])))
+    from sklearn.metrics import confusion_matrix, classification_report
+
+    cm = confusion_matrix(y_true_str, np.array(y_pred_labels_str, dtype=str), labels=labels_all)
+
+    normalize = st.checkbox("Normalize rows to percentage", value=False, help="Show each row as proportions of the true class total.")
+    cm_to_show = cm.astype(float)
+    if normalize:
+        row_sums = cm_to_show.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        cm_to_show = (cm_to_show / row_sums) * 100.0
+
+    # Plot heatmap with matplotlib (no seaborn)
+    fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
+    im = ax_cm.imshow(cm_to_show, cmap="Blues")
+    ax_cm.set_xticks(range(len(labels_all)))
+    ax_cm.set_yticks(range(len(labels_all)))
+    ax_cm.set_xticklabels(labels_all)
+    ax_cm.set_yticklabels(labels_all)
+    ax_cm.set_xlabel("Predicted label")
+    ax_cm.set_ylabel("True label")
+    ax_cm.set_title("Confusion Matrix" + (" (%)" if normalize else " (counts)"))
+    # annotate cells
+    for i in range(cm_to_show.shape[0]):
+        for j in range(cm_to_show.shape[1]):
+            val = cm_to_show[i, j]
+            txt = f"{val:.1f}%" if normalize else f"{int(val)}"
+            ax_cm.text(j, i, txt, ha="center", va="center", color="black")
+    plt.tight_layout()
+    st.pyplot(fig_cm)
+
+    # Optional summary metrics (precision/recall/F1) for multiclass too
+    with st.expander("Show classification report"):
+        try:
+            report = classification_report(y_true_str, np.array(y_pred_labels_str, dtype=str), labels=labels_all, zero_division=0, output_dict=False)
+            st.text(report)
+        except Exception as e:
+            st.write("Could not compute classification report:", e)
+
+    # ----- ROC & AUC (binary only) -----
+    st.subheader("ROC & AUC")
+    if not is_binary:
+        st.info("ROC/AUC shown only for binary problems. Detected classes: " + ", ".join(map(str, unique_classes)))
     else:
-        # Retrieve test data from session state
-        X_test = st.session_state["X_test"]
-        y_test = st.session_state["y_test"]
+        if not y_scores:
+            st.warning("No probability scores available for ROC.")
+        else:
+            from sklearn.metrics import roc_curve, auc
+            fpr, tpr, thresholds = roc_curve(y_true_str, np.array(y_scores, dtype=float), pos_label=pos_label_str)
+            roc_auc = auc(fpr, tpr)
+            st.write(f"ROC AUC: {roc_auc:.3f}")
 
-        # Let user choose prediction mode for evaluation
-        eval_mode = st.radio("Prediction Mode for Evaluation", options=["Single Tree", "Ensemble"], key="eval_mode")
-
-        # List to store predicted probability for the positive class (assumed label "1")
-        y_scores = []
-
-        # Use the same label_to_tree_id and helper functions from your app.
-        # Assuming these functions are defined above in your app:
-        # load_tree(tree_id) and predict_from_tree(tree, input_features)
-        if eval_mode == "Single Tree":
-            selected_label_eval = st.selectbox("Select Tree for Evaluation", list(label_to_tree_id.keys()), key="eval_tree")
-            tree_id_eval = label_to_tree_id[selected_label_eval]
-            tree_data_eval = load_tree(tree_id_eval)
-            for row in X_test:
-                # Predict returns (prediction, path); we ignore the path here.
-                pred, _ = predict_from_tree(tree_data_eval, list(row))
-                # Assume the positive class is labeled "1"
-                y_scores.append(pred.get("1", 0))
-        else:  # Ensemble mode
-            all_tree_files = sorted([f for f in os.listdir(MODELS_DIR) if f.startswith("tree_") and f.endswith(".json")])
-            for row in X_test:
-                ensemble_preds = []
-                for file in all_tree_files:
-                    try:
-                        tid = int(file.split("_")[1].split(".")[0])
-                    except ValueError:
-                        continue
-                    tree_data = load_tree(tid)
-                    pred, _ = predict_from_tree(tree_data, list(row))
-                    ensemble_preds.append(pred.get("1", 0))
-                if ensemble_preds:
-                    ensemble_avg = sum(ensemble_preds) / len(ensemble_preds)
-                else:
-                    ensemble_avg = 0
-                y_scores.append(ensemble_avg)
-        
-        # Compute ROC curve and AUC
-        # Make sure y_test is numeric (e.g., contains 0 and 1)
-        fpr, tpr, thresholds = roc_curve(y_test, y_scores, pos_label=1)
-        roc_auc = auc(fpr, tpr)
-        st.write(f"ROC AUC: {roc_auc:.3f}")
-        
-        # Plot ROC curve
-        fig, ax = plt.subplots()
-        ax.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (AUC = {roc_auc:.2f})")
-        ax.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
-        ax.set_xlim([0.0, 1.0])
-        ax.set_ylim([0.0, 1.05])
-        ax.set_xlabel("False Positive Rate")
-        ax.set_ylabel("True Positive Rate")
-        ax.set_title("Receiver Operating Characteristic")
-        ax.legend(loc="lower right")
-        st.pyplot(fig)
+            fig, ax = plt.subplots()
+            ax.plot(fpr, tpr, lw=2, label=f"ROC (AUC = {roc_auc:.2f})")
+            ax.plot([0, 1], [0, 1], lw=1.5, linestyle="--")
+            ax.set_xlim([0.0, 1.0])
+            ax.set_ylim([0.0, 1.05])
+            ax.set_xlabel("False Positive Rate")
+            ax.set_ylabel("True Positive Rate")
+            ax.set_title("Receiver Operating Characteristic")
+            ax.legend(loc="lower right")
+            st.pyplot(fig)
