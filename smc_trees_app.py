@@ -577,70 +577,70 @@ with tab3:
         return nodes_list[0]["id"]
 
 
-    # --- Robust JSON-tree helpers (handles different schemas) ---
-def _is_leaf(n):
-    # explicit flags
-    if n.get("is_leaf") is True or n.get("leaf") is True:
-        return True
-    # structural leaf (no children)
-    l = n.get("left", n.get("left_id"))
-    r = n.get("right", n.get("right_id"))
-    return (l in (None, "", -1)) and (r in (None, "", -1))
+        # --- Robust JSON-tree helpers (handles different schemas) ---
+    def _is_leaf(n):
+        # explicit flags
+        if n.get("is_leaf") is True or n.get("leaf") is True:
+            return True
+        # structural leaf (no children)
+        l = n.get("left", n.get("left_id"))
+        r = n.get("right", n.get("right_id"))
+        return (l in (None, "", -1)) and (r in (None, "", -1))
+    
+    def _leaf_label(n):
+        """Return a string label for a leaf node under multiple possible schemas."""
+        # 1) Direct scalar fields
+        for k in ("class", "label", "pred", "prediction", "yhat", "y", "target", "class_index"):
+            if k in n and n[k] is not None and not isinstance(n[k], (list, dict)):
+                return str(n[k])
+    
+        # 2) Probabilities dict (your trees use this)
+        for k in ("probabilities", "proba", "prob", "probs"):
+            if k in n and n[k] is not None:
+                probs = n[k]
+                if isinstance(probs, dict) and len(probs):
+                    # argmax by value
+                    return str(max(probs.items(), key=lambda kv: kv[1])[0])
+    
+        # 3) Class counts/histograms
+        for k in ("counts", "class_counts", "hist", "class_hist", "n_class", "counts_per_class"):
+            if k in n and n[k] is not None:
+                v = n[k]
+                if isinstance(v, dict) and len(v):
+                    return str(max(v.items(), key=lambda kv: kv[1])[0])
+    
+        # Fallback
+        return "NA"
 
-def _leaf_label(n):
-    """Return a string label for a leaf node under multiple possible schemas."""
-    # 1) Direct scalar fields
-    for k in ("class", "label", "pred", "prediction", "yhat", "y", "target", "class_index"):
-        if k in n and n[k] is not None and not isinstance(n[k], (list, dict)):
-            return str(n[k])
+    def _feature_threshold(n):
+        """Pull (feature, threshold) tolerating alternate key names."""
+        f = n.get("feature", n.get("feat", n.get("feature_index", n.get("split_feature"))))
+        t = n.get("threshold", n.get("thr", n.get("split_threshold", n.get("value"))))
+        if f is None or t is None:
+            raise KeyError("Missing feature/threshold in node.")
+        # ensure scalar
+        if isinstance(t, (list, tuple, np.ndarray)):
+            t = float(t[0])
+        return int(f), float(t)
 
-    # 2) Probabilities dict (your trees use this)
-    for k in ("probabilities", "proba", "prob", "probs"):
-        if k in n and n[k] is not None:
-            probs = n[k]
-            if isinstance(probs, dict) and len(probs):
-                # argmax by value
-                return str(max(probs.items(), key=lambda kv: kv[1])[0])
-
-    # 3) Class counts/histograms
-    for k in ("counts", "class_counts", "hist", "class_hist", "n_class", "counts_per_class"):
-        if k in n and n[k] is not None:
-            v = n[k]
-            if isinstance(v, dict) and len(v):
-                return str(max(v.items(), key=lambda kv: kv[1])[0])
-
-    # Fallback
-    return "NA"
-
-def _feature_threshold(n):
-    """Pull (feature, threshold) tolerating alternate key names."""
-    f = n.get("feature", n.get("feat", n.get("feature_index", n.get("split_feature"))))
-    t = n.get("threshold", n.get("thr", n.get("split_threshold", n.get("value"))))
-    if f is None or t is None:
-        raise KeyError("Missing feature/threshold in node.")
-    # ensure scalar
-    if isinstance(t, (list, tuple, np.ndarray)):
-        t = float(t[0])
-    return int(f), float(t)
-
-def _node_map_and_root(nodes_list):
-    """Return (nodes_dict, root_id_str) with string IDs for consistency."""
-    nodes = {}
-    child_ids = set()
-    for n in nodes_list:
-        nid = str(n.get("id", n.get("nid", n.get("node_id"))))
-        nodes[nid] = n
-        if not _is_leaf(n):
-            l = n.get("left", n.get("left_id"))
-            r = n.get("right", n.get("right_id"))
-            if l is not None: child_ids.add(str(l))
-            if r is not None: child_ids.add(str(r))
-    # root = node never referenced as child
-    for nid in nodes:
-        if nid not in child_ids:
-            return nodes, nid
-    # fallback
-    return nodes, next(iter(nodes))
+    def _node_map_and_root(nodes_list):
+        """Return (nodes_dict, root_id_str) with string IDs for consistency."""
+        nodes = {}
+        child_ids = set()
+        for n in nodes_list:
+            nid = str(n.get("id", n.get("nid", n.get("node_id"))))
+            nodes[nid] = n
+            if not _is_leaf(n):
+                l = n.get("left", n.get("left_id"))
+                r = n.get("right", n.get("right_id"))
+                if l is not None: child_ids.add(str(l))
+                if r is not None: child_ids.add(str(r))
+        # root = node never referenced as child
+        for nid in nodes:
+            if nid not in child_ids:
+                return nodes, nid
+        # fallback
+        return nodes, next(iter(nodes))
 
 
     def predict_tree_json(tree, X):
@@ -1426,4 +1426,5 @@ with tab9:
             ax.set_title("Receiver Operating Characteristic")
             ax.legend(loc="lower right")
             st.pyplot(fig)
+
 
