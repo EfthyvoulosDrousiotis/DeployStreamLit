@@ -506,6 +506,12 @@ from collections import defaultdict
 # ----------------------
 # Tab 3 • Feature Importance  +  Row-Weighted Consensus Tree
 # ----------------------
+import os, json, hashlib
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
+import streamlit as st
+
 with tab3:
     st.header("📊 Feature Importance & Consensus Tree")
 
@@ -531,16 +537,19 @@ with tab3:
 
     # ── Bar chart & table
     items = sorted(imp_dict.items(), key=lambda x: x[1], reverse=True)
-    feats, imps = zip(*items)
-    fig, ax = plt.subplots(figsize=(8, max(4, len(feats) * 0.4)))
-    ax.barh(feats[::-1], [v * 100 for v in imps[::-1]], color="skyblue")
-    ax.set_xlabel("Importance (%)")
-    ax.set_title(f"Feature importance • {metric_choice}")
-    st.pyplot(fig)
-    st.dataframe(
-        {"Feature": feats, "Importance (%)": [round(v * 100, 2) for v in imps]},
-        use_container_width=True,
-    )
+    feats, imps = zip(*items) if items else ([], [])
+    if len(imps) == 0:
+        st.info("No feature-importance data found.")
+    else:
+        fig, ax = plt.subplots(figsize=(8, max(4, len(feats) * 0.4)))
+        ax.barh(feats[::-1], [v * 100 for v in imps[::-1]])
+        ax.set_xlabel("Importance (%)")
+        ax.set_title(f"Feature importance • {metric_choice}")
+        st.pyplot(fig)
+        st.dataframe(
+            {"Feature": feats, "Importance (%)": [round(v * 100, 2) for v in imps]},
+            use_container_width=True,
+        )
 
     # 2️⃣  Consensus tree prerequisites
     if "X_test" not in st.session_state or "y_test" not in st.session_state:
@@ -549,58 +558,129 @@ with tab3:
 
     X_test = st.session_state["X_test"]
     y_test = st.session_state["y_test"]
-    feature_names = load_feature_names()
+    feature_names = load_feature_names()  # must exist in your app
     max_depth = st.slider("Consensus-tree max depth", 1, 6, 3)
 
-    # ── Build cached consensus tree (row-weighted option-B)
-    @st.cache_data(show_spinner=False)
-    def build_consensus(depth_cap):
-        tree_files = [f for f in os.listdir(MODELS_DIR) if f.startswith("tree_")]
-        ensemble   = [load_tree(int(f.split("_")[1].split(".")[0])) for f in tree_files]
+    # Utility: robust root detection + JSON-tree predictor
+    def _root_id(nodes_list):
+        nodes = {n["id"]: n for n in nodes_list}
+        child_ids = set()
+        for n in nodes_list:
+            if not n.get("is_leaf", False):
+                if n.get("left")  is not None: child_ids.add(n["left"])
+                if n.get("right") is not None: child_ids.add(n["right"])
+        # root is any node id that is never referenced as a child
+        for nid in nodes:
+            if nid not in child_ids:
+                return nid
+        # fallback: first node
+        return nodes_list[0]["id"]
 
-        def best_split(mask, depth_level):
-            counts = defaultdict(int)
-            for t in ensemble:
-                nodes = {n["id"]: n for n in t["nodes"]}
-                root  = next(n for n in t["nodes"]
-                             if not n["is_leaf"] and n.get("depth", -1) == 0)
-                stack = [(root, mask)]
-                while stack:
-                    node, m = stack.pop()
-                    if node.get("depth", -1) != depth_level or node["is_leaf"]:
-                        if not node["is_leaf"]:
-                            for cid, cond in (
-                                (node["left"],  lambda v: v <= node["threshold"]),
-                                (node["right"], lambda v: v >  node["threshold"]),
-                            ):
-                                child = nodes.get(cid)
-                                if child is not None and m.any():
-                                    new_mask = m & cond(X_test[:, node["feature"]])
-                                    if new_mask.any():
-                                        stack.append((child, new_mask))
-                        continue
-                    key = (node["feature"], node["threshold"])
+    def predict_tree_json(tree, X):
+        nodes = {n["id"]: n for n in tree["nodes"]}
+        rid = _root_id(tree["nodes"])
+        out = []
+        for row in X:
+            nid = rid
+            while not nodes[nid].get("is_leaf", False):
+                node = nodes[nid]
+                feat, thr = node["feature"], node["threshold"]
+                nid = node["left"] if row[feat] <= thr else node["right"]
+            out.append(str(nodes[nid]["class"]))
+        return np.array(out, dtype=str)
+
+    # Build votes once (predictions of each tree on X_test)
+    tree_files = [f for f in os.listdir(MODELS_DIR) if f.startswith("tree_")]
+    if len(tree_files) == 0:
+        st.error("No trees found in the models directory.")
+        st.stop()
+
+    ensemble   = [load_tree(int(f.split("_")[1].split(".")[0])) for f in tree_files]
+    V = np.vstack([predict_tree_json(t, X_test) for t in ensemble])   # shape [T, N]
+    T, N = V.shape
+
+    # Optional weights over trees (uniform here; plug in your SMC weights if you have them)
+    w = np.ones(T, dtype=float)
+
+    # Majority label for each row j across trees (weighted)
+    def per_row_majority(mask):
+        cols = np.where(mask)[0]
+        chosen = []
+        for j in cols:
+            vals, inv = np.unique(V[:, j], return_inverse=True)
+            counts = np.bincount(inv, weights=w, minlength=len(vals))
+            chosen.append(vals[int(np.argmax(counts))])
+        return np.array(chosen, dtype=str)
+
+    # Region-level majority label across all rows & trees (for leaf assignment)
+    def region_majority(mask):
+        cols = np.where(mask)[0]
+        if len(cols) == 0:
+            return "NA"
+        # accumulate counts per label across trees and selected rows
+        label_counts = defaultdict(float)
+        for j in cols:
+            for i in range(T):
+                label_counts[V[i, j]] += w[i]
+        # pick argmax
+        return max(label_counts.items(), key=lambda kv: kv[1])[0]
+
+    # Split selection: count how many rows reach each (feature, threshold) at a given depth
+    def best_split(mask, depth_level):
+        counts = defaultdict(int)
+        m_any = int(mask.sum())
+        if m_any == 0:
+            return None
+        for t in ensemble:
+            nodes = {n["id"]: n for n in t["nodes"]}
+            rid = _root_id(t["nodes"])
+            stack = [(rid, mask, 0)]
+            while stack:
+                nid, m, d = stack.pop()
+                node = nodes[nid]
+                if node.get("is_leaf", False):
+                    continue
+                if d == depth_level:
+                    key = (node["feature"], float(node["threshold"]))
                     counts[key] += int(m.sum())
-            return max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
+                    # do not go deeper from this node when counting depth d
+                    continue
+                if not m.any():
+                    continue
+                feat, thr = node["feature"], node["threshold"]
+                xcol = X_test[:, feat]
+                lm = m & (xcol <= thr)
+                rm = m & (xcol >  thr)
+                if lm.any(): stack.append((node["left"],  lm, d+1))
+                if rm.any(): stack.append((node["right"], rm, d+1))
+        return max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
 
+    # Hash inputs for cache keying (prevents stale results if data changes)
+    x_hash = hashlib.md5(X_test.tobytes()).hexdigest()
+    y_hash = hashlib.md5(y_test.astype(str).tobytes()).hexdigest()
+    tree_sig = (len(ensemble),) + tuple(sorted(tree_files))
+
+    @st.cache_data(show_spinner=False)
+    def build_consensus(depth_cap, x_sig, y_sig, tree_signature):
+        # Recursion that uses ensemble votes only (no y_test leakage)
         def recurse(mask, depth):
-            uni = np.unique(y_test[mask])
-            # stop criteria
-            if depth >= depth_cap or len(uni) == 1:
-                pred = uni[0] if len(uni) == 1 else uni[np.argmax(
-                    [(y_test[mask] == c).sum() for c in uni])]
+            # purity: if all per-row majorities agree, stop
+            row_maj = per_row_majority(mask)
+            uniq = np.unique(row_maj)
+            if depth >= depth_cap or len(uniq) <= 1:
+                pred = uniq[0] if len(uniq) == 1 else region_majority(mask)
                 return {"leaf": True, "class": str(pred)}
 
             split = best_split(mask, depth)
             if split is None:
-                pred = uni[np.argmax([(y_test[mask] == c).sum() for c in uni])]
+                pred = region_majority(mask)
                 return {"leaf": True, "class": str(pred)}
 
             feat, thr = split
             left_mask  = mask & (X_test[:, feat] <= thr)
             right_mask = mask & (X_test[:, feat] >  thr)
             if not left_mask.any() or not right_mask.any():
-                pred = uni[np.argmax([(y_test[mask] == c).sum() for c in uni])]
+                pred = region_majority(mask)
                 return {"leaf": True, "class": str(pred)}
 
             return {
@@ -610,50 +690,46 @@ with tab3:
                 "right": recurse(right_mask, depth + 1),
             }
 
-        tree_dict = recurse(np.ones(len(X_test), dtype=bool), 0)
+        tree_dict = recurse(np.ones(N, dtype=bool), 0)
 
-        # predict with built tree
+        # predict with built tree (evaluation uses y_test only here)
         def predict_one(row, node):
             while not node.get("leaf", False):
                 node = node["left"] if row[node["feature"]] <= node["threshold"] else node["right"]
             return node["class"]
 
         preds = np.array([predict_one(r, tree_dict) for r in X_test], dtype=str)
-        acc   = np.mean(preds == y_test.astype(str))     # compare as strings
-        
+        acc   = np.mean(preds == y_test.astype(str))
+
+        # leaf count
         def count_leaves(node):
             return 1 if node.get("leaf", False) else \
                    count_leaves(node["left"]) + count_leaves(node["right"])
-        st.write(f"Depth cap {depth_cap} → leaves {count_leaves(tree_dict)}")
-        
-        
-        
-        return tree_dict, acc
 
-    tree_dict, cons_acc = build_consensus(max_depth)
+        return tree_dict, acc, count_leaves(tree_dict)
+
+    tree_dict, cons_acc, n_leaves = build_consensus(max_depth, x_hash, y_hash, tree_sig)
 
     # 3️⃣  Graphviz render + accuracy
-    def to_dot(node, idx=[0], lines=None):
+    def to_dot(node, idx=None, lines=None):
+        if idx is None: idx = [0]
         if lines is None:
-            lines = ["digraph G{", "node [shape=box, style=rounded]"]
+            lines = ["digraph G{", 'node [shape=box, style="rounded,filled"]']
         this = idx[0]; idx[0] += 1
         if node.get("leaf", False):
-            lines.append(f'{this} [label="class = {node["class"]}", shape=oval, fillcolor=lightgreen, style=filled];')
+            lines.append(f'{this} [label="class = {node["class"]}", shape=oval, fillcolor=lightgreen];')
         else:
             lab = f'{feature_names[node["feature"]]} ≤ {node["threshold"]:.2f}'
             lines.append(f'{this} [label="{lab}", fillcolor=lightblue];')
-            l_id = idx[0]; to_dot(node["left"], idx, lines)
-            lines.append(f"{this} -> {l_id} [label=True];")
-            r_id = idx[0]; to_dot(node["right"], idx, lines)
-            lines.append(f"{this} -> {r_id} [label=False];")
+            l_id = idx[0]; to_dot(node["left"], idx, lines); lines.append(f"{this} -> {l_id} [label=True];")
+            r_id = idx[0]; to_dot(node["right"], idx, lines); lines.append(f"{this} -> {r_id} [label=False];")
         if this == 0:
             lines.append("}")
             return "\n".join(lines)
 
     st.graphviz_chart(to_dot(tree_dict))
     st.success(f"Consensus-tree accuracy on test set: **{cons_acc:.2%}**")
-
-
+    st.caption(f"{len(ensemble)} trees • depth cap {max_depth} • leaves {n_leaves}")
 
 
 
@@ -1283,3 +1359,4 @@ with tab9:
             ax.set_title("Receiver Operating Characteristic")
             ax.legend(loc="lower right")
             st.pyplot(fig)
+
