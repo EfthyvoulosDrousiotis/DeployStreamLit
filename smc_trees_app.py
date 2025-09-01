@@ -576,18 +576,87 @@ with tab3:
         # fallback: first node
         return nodes_list[0]["id"]
 
+
+    # --- Robust JSON-tree helpers (handles different schemas) ---
+def _is_leaf(n):
+    # explicit flags
+    if n.get("is_leaf") is True or n.get("leaf") is True:
+        return True
+    # structural leaf (no children)
+    l = n.get("left", n.get("left_id"))
+    r = n.get("right", n.get("right_id"))
+    return (l in (None, "", -1)) and (r in (None, "", -1))
+
+def _leaf_label(n):
+    """Return a string label for a leaf node under multiple possible schemas."""
+    # 1) Direct scalar fields
+    for k in ("class", "label", "pred", "prediction", "yhat", "y", "target", "class_index"):
+        if k in n and n[k] is not None and not isinstance(n[k], (list, dict)):
+            return str(n[k])
+
+    # 2) Probabilities dict (your trees use this)
+    for k in ("probabilities", "proba", "prob", "probs"):
+        if k in n and n[k] is not None:
+            probs = n[k]
+            if isinstance(probs, dict) and len(probs):
+                # argmax by value
+                return str(max(probs.items(), key=lambda kv: kv[1])[0])
+
+    # 3) Class counts/histograms
+    for k in ("counts", "class_counts", "hist", "class_hist", "n_class", "counts_per_class"):
+        if k in n and n[k] is not None:
+            v = n[k]
+            if isinstance(v, dict) and len(v):
+                return str(max(v.items(), key=lambda kv: kv[1])[0])
+
+    # Fallback
+    return "NA"
+
+def _feature_threshold(n):
+    """Pull (feature, threshold) tolerating alternate key names."""
+    f = n.get("feature", n.get("feat", n.get("feature_index", n.get("split_feature"))))
+    t = n.get("threshold", n.get("thr", n.get("split_threshold", n.get("value"))))
+    if f is None or t is None:
+        raise KeyError("Missing feature/threshold in node.")
+    # ensure scalar
+    if isinstance(t, (list, tuple, np.ndarray)):
+        t = float(t[0])
+    return int(f), float(t)
+
+def _node_map_and_root(nodes_list):
+    """Return (nodes_dict, root_id_str) with string IDs for consistency."""
+    nodes = {}
+    child_ids = set()
+    for n in nodes_list:
+        nid = str(n.get("id", n.get("nid", n.get("node_id"))))
+        nodes[nid] = n
+        if not _is_leaf(n):
+            l = n.get("left", n.get("left_id"))
+            r = n.get("right", n.get("right_id"))
+            if l is not None: child_ids.add(str(l))
+            if r is not None: child_ids.add(str(r))
+    # root = node never referenced as child
+    for nid in nodes:
+        if nid not in child_ids:
+            return nodes, nid
+    # fallback
+    return nodes, next(iter(nodes))
+
+
     def predict_tree_json(tree, X):
-        nodes = {n["id"]: n for n in tree["nodes"]}
-        rid = _root_id(tree["nodes"])
+        nodes, rid = _node_map_and_root(tree["nodes"])
         out = []
         for row in X:
             nid = rid
-            while not nodes[nid].get("is_leaf", False):
+            # descend until leaf
+            while not _is_leaf(nodes[nid]):
                 node = nodes[nid]
-                feat, thr = node["feature"], node["threshold"]
-                nid = node["left"] if row[feat] <= thr else node["right"]
-            out.append(str(nodes[nid]["class"]))
+                f, thr = _feature_threshold(node)
+                nxt = node.get("left") if row[f] <= thr else node.get("right")
+                nid = str(nxt)
+            out.append(_leaf_label(nodes[nid]))
         return np.array(out, dtype=str)
+
 
     # Build votes once (predictions of each tree on X_test)
     tree_files = [f for f in os.listdir(MODELS_DIR) if f.startswith("tree_")]
@@ -628,32 +697,30 @@ with tab3:
     # Split selection: count how many rows reach each (feature, threshold) at a given depth
     def best_split(mask, depth_level):
         counts = defaultdict(int)
-        m_any = int(mask.sum())
-        if m_any == 0:
+        if int(mask.sum()) == 0:
             return None
         for t in ensemble:
-            nodes = {n["id"]: n for n in t["nodes"]}
-            rid = _root_id(t["nodes"])
+            nodes, rid = _node_map_and_root(t["nodes"])
             stack = [(rid, mask, 0)]
             while stack:
                 nid, m, d = stack.pop()
                 node = nodes[nid]
-                if node.get("is_leaf", False):
+                if _is_leaf(node):
                     continue
                 if d == depth_level:
-                    key = (node["feature"], float(node["threshold"]))
-                    counts[key] += int(m.sum())
-                    # do not go deeper from this node when counting depth d
+                    f, thr = _feature_threshold(node)
+                    counts[(f, float(thr))] += int(m.sum())
                     continue
                 if not m.any():
                     continue
-                feat, thr = node["feature"], node["threshold"]
-                xcol = X_test[:, feat]
+                f, thr = _feature_threshold(node)
+                xcol = X_test[:, f]
                 lm = m & (xcol <= thr)
                 rm = m & (xcol >  thr)
-                if lm.any(): stack.append((node["left"],  lm, d+1))
-                if rm.any(): stack.append((node["right"], rm, d+1))
+                if lm.any(): stack.append((str(node.get("left")),  lm, d+1))
+                if rm.any(): stack.append((str(node.get("right")), rm, d+1))
         return max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
+
 
     # Hash inputs for cache keying (prevents stale results if data changes)
     x_hash = hashlib.md5(X_test.tobytes()).hexdigest()
