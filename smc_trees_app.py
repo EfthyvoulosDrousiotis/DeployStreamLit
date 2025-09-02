@@ -114,22 +114,28 @@ def encode_categoricals(df: pd.DataFrame,
 
 def visualize_tree(tree_data, feature_names):
     dot = graphviz.Digraph()
+    # Set sensible defaults (rounded boxes, filled)
+    dot.attr('node', style='rounded,filled')
+
     for node in tree_data["nodes"]:
         if node["is_leaf"]:
-            probs = node["probabilities"]
+            probs = node.get("probabilities", {})
             prob_str = "\n".join([f"Class {cls}: {prob*100:.1f}%" for cls, prob in probs.items()])
             label = f"Leaf {node['id']}\n{prob_str}"
-            dot.node(str(node["id"]), label, shape='box', style='filled', color='lightgreen')
+            # Use fillcolor for background, color for border
+            dot.node(str(node["id"]), label, shape='box', fillcolor='lightgreen', color='darkgreen')
         else:
             feature_idx = node['feature']
             feature_name = feature_names[feature_idx] if feature_idx < len(feature_names) else f"Feature {feature_idx}"
             label = f"{feature_name} ≤ {node['threshold']:.2f}"
-            dot.node(str(node["id"]), label, shape='ellipse', style='filled', color='lightblue')
+            dot.node(str(node["id"]), label, shape='ellipse', fillcolor='lightblue', color='steelblue')
+
     for node in tree_data["nodes"]:
         if not node["is_leaf"]:
-            dot.edge(str(node["id"]), str(node["left"]), label="True")
+            dot.edge(str(node["id"]), str(node["left"]),  label="True")
             dot.edge(str(node["id"]), str(node["right"]), label="False")
     return dot
+
 
 def predict_from_tree(tree, input_features):
     """
@@ -199,36 +205,44 @@ def predict_from_tree(tree, input_features):
 
 def visualize_tree_with_path(tree_data, feature_names, path):
     dot = graphviz.Digraph()
+    dot.attr('node', style='rounded,filled')
+
+    in_path = set(path)
+
     for node in tree_data["nodes"]:
         if node.get("is_leaf", False):
             probs = node.get("probabilities", {})
             prob_str = "\n".join([f"Class {cls}: {prob*100:.1f}%" for cls, prob in probs.items()])
             label = f"Leaf {node['id']}\n{prob_str}"
-            if node["id"] in path:
-                dot.node(str(node["id"]), label, shape='box', style='filled', color='red')
+            if node["id"] in in_path:
+                # highlight with a distinct fill; keep border visible
+                dot.node(str(node["id"]), label, shape='box', fillcolor='salmon', color='red')
             else:
-                dot.node(str(node["id"]), label, shape='box', style='filled', color='lightgreen')
+                dot.node(str(node["id"]), label, shape='box', fillcolor='lightgreen', color='darkgreen')
         else:
             feature_idx = node["feature"]
             feature_name = feature_names[feature_idx] if feature_idx < len(feature_names) else f"Feature {feature_idx}"
             label = f"{feature_name} ≤ {node['threshold']:.2f}"
-            if node["id"] in path:
-                dot.node(str(node["id"]), label, shape='ellipse', style='filled', color='red')
+            if node["id"] in in_path:
+                dot.node(str(node["id"]), label, shape='ellipse', fillcolor='lightsalmon', color='red')
             else:
-                dot.node(str(node["id"]), label, shape='ellipse', style='filled', color='lightblue')
+                dot.node(str(node["id"]), label, shape='ellipse', fillcolor='lightblue', color='steelblue')
+
     for node in tree_data["nodes"]:
         if not node.get("is_leaf", False):
             left_id = node["left"]
             right_id = node["right"]
-            if node["id"] in path and left_id in path:
-                dot.edge(str(node["id"]), str(left_id), label="True", color="red", penwidth="2")
+            # highlight edges if both endpoints are on the path
+            if node["id"] in in_path and left_id in in_path:
+                dot.edge(str(node["id"]), str(left_id),  label="True",  color="red", penwidth="2")
             else:
-                dot.edge(str(node["id"]), str(left_id), label="True")
-            if node["id"] in path and right_id in path:
+                dot.edge(str(node["id"]), str(left_id),  label="True")
+            if node["id"] in in_path and right_id in in_path:
                 dot.edge(str(node["id"]), str(right_id), label="False", color="red", penwidth="2")
             else:
                 dot.edge(str(node["id"]), str(right_id), label="False")
     return dot
+
 
 
 # ----------------------
@@ -1426,5 +1440,6 @@ with tab9:
             ax.set_title("Receiver Operating Characteristic")
             ax.legend(loc="lower right")
             st.pyplot(fig)
+
 
 
