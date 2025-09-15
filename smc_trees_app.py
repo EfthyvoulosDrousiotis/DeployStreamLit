@@ -2,23 +2,21 @@ import streamlit as st
 import json
 import graphviz
 import os
-import subprocess
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import plotly.express as px
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_curve, auc
-import plotly.express as px
-import plotly.graph_objects as go
+
 # Import the training function from decision_tree_driver.py
 from examples.decision_tree_driver import train_smc_model, save_tree_to_json
 
 st.title("🌳 Sequential Monte Carlo Trees Dashboard")
 
 # ----------------------
-# Helper Functions
+# Helper / constants
 # ----------------------
-# Define a dedicated folder for tree models
 MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -49,92 +47,64 @@ def get_valid_tree_files():
                 st.write(f"Skipping {filename} due to error: {e}")
     return valid_files
 
-import pandas as pd
-import json
-import numpy as np
-from pathlib import Path
-
-import pandas as pd, numpy as np, json
-from pathlib import Path
-
-def encode_categoricals(df: pd.DataFrame,
-                        save_path: str = "categorical_encodings.json"):
+def encode_categoricals(df: pd.DataFrame, save_path: str = "categorical_encodings.json"):
     """
     • Converts object columns that are fully numeric (even if stored as str)
       → numeric dtype (Int64 or float64).
     • Converts remaining non-numeric object columns → categorical integer codes.
     • Returns (encoded_df, mapping_dict).  Mapping only for categorical columns.
     """
-    enc_map  = {}            # {column: {original_label: int_code}}
+    enc_map  = {}
     df_enc   = df.copy()
 
     for col in df.columns:
         if not pd.api.types.is_object_dtype(df[col]):
-            # already numeric, boolean, datetime, etc.
             continue
 
-        # Clean: strip whitespace, turn "" and '?' into NaN
         ser = (df[col]
                .astype(str)
                .str.strip()
                .replace({"": np.nan, "nan": np.nan, "?": np.nan}))
 
-        # Try numeric conversion
         numeric_try = pd.to_numeric(ser, errors="coerce")
-
         all_numeric = numeric_try.notna().sum() == ser.notna().sum()
 
         if all_numeric:
-            # Pure numeric column masquerading as strings
-            if (numeric_try.dropna() % 1 == 0).all():
-                # All whole numbers → nullable Int64
+            # if all valid entries are whole numbers -> Int64
+            vals = numeric_try.dropna()
+            if len(vals) and (vals % 1 == 0).all():
                 df_enc[col] = numeric_try.astype("Int64")
             else:
                 df_enc[col] = numeric_try.astype(float)
         else:
-            # Genuine categorical column → factorize
+            # real categorical
             codes, labels = pd.factorize(ser, sort=True)
-            # Replace -1 (pd.factorize NaN marker) with pd.NA before casting
             codes_ser = pd.Series(codes).replace({-1: pd.NA})
             df_enc[col] = codes_ser.astype("Int64")
+            enc_map[col] = {str(label): int(code) for code, label in enumerate(labels)}
 
-            enc_map[col] = {str(label): int(code)
-                            for code, label in enumerate(labels)}
-
-    # Persist mapping for later prediction use
-    if enc_map:   # only write file if there is at least one categorical
+    if enc_map:
         Path(save_path).write_text(json.dumps(enc_map, indent=2))
 
     return df_enc, enc_map
 
-
 def visualize_tree(tree_data, feature_names):
     dot = graphviz.Digraph()
-    dot.attr('node', style='rounded,filled')  # harmless default, but don’t rely on it
+    dot.attr('node', style='rounded,filled')
 
     for node in tree_data["nodes"]:
         if node["is_leaf"]:
             probs = node.get("probabilities", {})
             prob_str = "\n".join([f"Class {cls}: {prob*100:.1f}%" for cls, prob in probs.items()])
             label = f"Leaf {node['id']}\n{prob_str}"
-            dot.node(
-                str(node["id"]), label,
-                shape='box',
-                style='filled,rounded',   # <<< add this
-                fillcolor='lightgreen',
-                color='darkgreen'
-            )
+            dot.node(str(node["id"]), label, shape='box',
+                     style='filled,rounded', fillcolor='lightgreen', color='darkgreen')
         else:
             feature_idx = node['feature']
             feature_name = feature_names[feature_idx] if feature_idx < len(feature_names) else f"Feature {feature_idx}"
             label = f"{feature_name} ≤ {node['threshold']:.2f}"
-            dot.node(
-                str(node["id"]), label,
-                shape='ellipse',
-                style='filled',           # <<< add this
-                fillcolor='lightblue',
-                color='steelblue'
-            )
+            dot.node(str(node["id"]), label, shape='ellipse',
+                     style='filled', fillcolor='lightblue', color='steelblue')
 
     for node in tree_data["nodes"]:
         if not node["is_leaf"]:
@@ -142,17 +112,12 @@ def visualize_tree(tree_data, feature_names):
             dot.edge(str(node["id"]), str(node["right"]), label="False")
     return dot
 
-
-
 def predict_from_tree(tree, input_features):
     """
     Walks the tree for a single input and returns (probabilities, path).
-    If any node or input is invalid, logs an error to Streamlit and returns ({}, path_so_far).
     """
-    # Build a dict for quick node lookup
     nodes = {node["id"]: node for node in tree["nodes"]}
 
-    # 1) Find the root (depth == 0, not a leaf)
     root = next(
         (n for n in tree["nodes"]
          if not n.get("is_leaf", False) and n.get("depth", -1) == 0),
@@ -165,14 +130,11 @@ def predict_from_tree(tree, input_features):
     path = [root["id"]]
     current = root
 
-    # 2) Traverse until you hit a leaf
     while not current.get("is_leaf", False):
-        # 2a) Validate node has 'feature' & 'threshold'
         if "feature" not in current or "threshold" not in current:
             st.error(f"❌ Node {current.get('id')} is missing 'feature' or 'threshold'.")
             return {}, path
 
-        # 2b) Parse them safely
         try:
             feature_idx = int(current["feature"])
             threshold = float(current["threshold"])
@@ -180,15 +142,10 @@ def predict_from_tree(tree, input_features):
             st.error(f"❌ Invalid 'feature' or 'threshold' at node {current['id']}.")
             return {}, path
 
-        # 2c) Bounds‐check the feature index
         if feature_idx < 0 or feature_idx >= len(input_features):
-            st.error(
-                f"❌ Feature index {feature_idx} out of range "
-                f"(you have {len(input_features)} features)."
-            )
+            st.error(f"❌ Feature index {feature_idx} out of range (have {len(input_features)} features).")
             return {}, path
 
-        # 2d) Cast your input value to float
         raw_val = input_features[feature_idx]
         try:
             feature_value = float(raw_val)
@@ -196,19 +153,14 @@ def predict_from_tree(tree, input_features):
             st.error(f"❌ Invalid feature value for index {feature_idx}: {raw_val}")
             return {}, path
 
-        # 2e) Decide branch
         next_id = current["left"] if feature_value <= threshold else current["right"]
         path.append(next_id)
-
-        # 2f) Lookup the next node
         current = nodes.get(next_id)
         if current is None:
             st.error(f"❌ Could not find node with id {next_id} in tree JSON.")
             return {}, path
 
-    # 3) We’re at a leaf → return its probabilities
     return current.get("probabilities", {}), path
-
 
 def visualize_tree_with_path(tree_data, feature_names, path):
     dot = graphviz.Digraph()
@@ -250,12 +202,6 @@ def visualize_tree_with_path(tree_data, feature_names, path):
                 dot.edge(str(node["id"]), str(right_id), label="False")
     return dot
 
-
-
-
-# ----------------------
-# Helper Function to Rebuild Tree Mapping
-# ----------------------
 def build_label_to_tree_id():
     tree_files = sorted([f for f in os.listdir(MODELS_DIR) if f.startswith("tree_") and f.endswith(".json")])
     mapping = {}
@@ -272,58 +218,22 @@ def build_label_to_tree_id():
             mapping[label] = tree_id
     return mapping
 
-
-
-
-
+from pathlib import Path
 
 def infer_and_convert_types(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Given a DataFrame where many columns are object dtype,
-    strip whitespace, coerce common missing markers to NaN,
-    then infer & convert each column to int or float where possible.
-    """
-    # 1) Strip whitespace from strings
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-
-    # 2) Replace blank strings or '?' with NaN
     df = df.replace({'': np.nan, '?': np.nan})
-
-    # 3) For each object column, try to convert to numeric
     for col in df.columns:
         if df[col].dtype == object:
-            # Attempt numeric conversion (floats or ints)
             converted = pd.to_numeric(df[col], errors='coerce')
-            mask = df[col].notna()  # where original had something
-
-            # If every non-null original is now numeric
+            mask = df[col].notna()
             if converted[mask].notna().all():
-                # Check if all (non-na) values are whole numbers
                 non_na = converted.dropna()
-                if (non_na % 1 == 0).all():
-                    # Use pandas’ nullable integer dtype
+                if len(non_na) and (non_na % 1 == 0).all():
                     df[col] = converted.astype("Int64")
                 else:
                     df[col] = converted
-            # else: leave df[col] as object
-
     return df
-
-# ----------------------
-# Build mapping for tree selection (for visualization tabs)
-# ----------------------
-# tree_files = sorted([f for f in os.listdir() if f.startswith("tree_") and f.endswith(".json")])
-# label_to_tree_id = {}
-# for filename in tree_files:
-#     try:
-#         tree_id = int(filename.split("_")[1].split(".")[0])
-#     except ValueError:
-#         continue
-#     data = load_tree(tree_id)
-#     stats = data["stats"]
-#     label = (f"Tree {tree_id} | Nodes: {stats['num_nodes']} | Leaves: {stats['num_leaves']} | "
-#               f"Depth: {stats['max_depth']} | Accuracy: {stats['accuracy']:.2%}")
-#     label_to_tree_id[label] = tree_id
 
 # ----------------------
 # Create Tabs
@@ -350,17 +260,15 @@ with tab0:
     uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"], key="train_csv")
 
     if uploaded_file is not None:
-        # Read everything as string first so we can clean universally
+        # Read as string → then clean/encode
         df_raw = pd.read_csv(uploaded_file, dtype=str)
         st.write("Dataset preview (first 10 rows):")
         st.dataframe(df_raw.head(10), use_container_width=True)
 
-        # ── Missing-value summary
         st.subheader("Missing value summary")
         missing_summary = df_raw.replace({"": np.nan}).isna().sum()
         st.dataframe(missing_summary.to_frame("Missing"), use_container_width=True)
 
-        # ── Optional: user-chosen cleaning for missing values
         if missing_summary.sum() > 0:
             with st.expander("🧹 Handle missing values"):
                 choice = st.selectbox(
@@ -385,7 +293,7 @@ with tab0:
         else:
             df_clean = df_raw.copy()
 
-        # ── 2️⃣  Encode categoricals automatically
+        # Auto-encode categoricals / numeric-looking strings
         df_clean, enc_map = encode_categoricals(df_clean)
         if enc_map:
             st.success("Categorical columns auto-encoded.")
@@ -401,17 +309,14 @@ with tab0:
         else:
             st.info("No categorical columns detected.")
 
-        # ── 3️⃣  Select target & define feature list
         all_cols = list(df_clean.columns)
         target_column = st.selectbox("Select target column", all_cols)
         feature_columns = [c for c in all_cols if c != target_column]
         st.write("**Features used:**", feature_columns)
 
-        # Save feature names for downstream tabs
         with open("feature_names.json", "w") as f:
             json.dump(feature_columns, f, indent=2)
 
-        # ── 4️⃣  Training parameters
         st.subheader("SMC parameters")
         tree_size       = st.number_input("Tree size (a)",          min_value=1, value=10, step=1)
         num_iterations  = st.number_input("Number of iterations",   min_value=1, value=10, step=1)
@@ -419,14 +324,11 @@ with tab0:
         resampling_opts = ["residual", "systematic", "knapsack", "min_error", "variational", "min_error_imp", "CIR"]
         resampling_scheme = st.selectbox("Resampling scheme", resampling_opts)
 
-        # ── 5️⃣  Persist cleaned CSV for driver
         csv_path = f"datasets/{uploaded_file.name}"
         os.makedirs("datasets", exist_ok=True)
         df_clean.to_csv(csv_path, index=False)
 
-        # ── 6️⃣  Train button
         if st.button("🚀 Train SMC Model"):
-            # Clear old trees
             for f in os.listdir(MODELS_DIR):
                 if f.startswith("tree_") and f.endswith(".json"):
                     os.remove(os.path.join(MODELS_DIR, f))
@@ -443,10 +345,9 @@ with tab0:
 
             if accuracy is not None:
                 st.success(f"Training done. Ensemble accuracy: {accuracy:.2%}")
-                # Split and stash test arrays for later tabs
+                # Prepare a clean test split for downstream tabs
                 X = df_clean[feature_columns].to_numpy()
                 y = df_clean[target_column].to_numpy()
-                from sklearn.model_selection import train_test_split
                 X_train, X_test, y_train, y_test = train_test_split(
                     X, y, test_size=0.30, random_state=42
                 )
@@ -456,16 +357,13 @@ with tab0:
             else:
                 st.error("Training failed. Check the console logs.")
 
-
-
-
 # ----------------------
 # Tab 1: Single Tree View
 # ----------------------
 with tab1:
     st.header("Single Tree Visualization")
     tree_files = sorted([f for f in os.listdir(MODELS_DIR) if f.startswith("tree_") and f.endswith(".json")])
-    
+
     if not tree_files:
         st.info("No trees found. Please train a model first (Tab 0).")
     else:
@@ -490,14 +388,11 @@ with tab1:
         else:
             st.info("No valid tree data available yet.")
 
-
-
 # ----------------------
 # Tab 2: Compare Trees (Side-by-Side)
 # ----------------------
 with tab2:
     st.header("Side-by-Side Tree Comparison")
-    # Rebuild mapping using the helper function:
     mapping = build_label_to_tree_id()
     if not mapping:
         st.error("No trees available. Please train the model first in the 'Train SMC Model' section.")
@@ -520,24 +415,16 @@ with tab2:
             tree_viz2 = visualize_tree(tree_data2, load_feature_names())
             st.graphviz_chart(tree_viz2)
 
-# ─── required import ───────────────────────────────────────────────
-from collections import defaultdict
-# ───────────────────────────────────────────────────────────────────
-
-
 # ----------------------
-# Tab 3 • Feature Importance  +  Row-Weighted Consensus Tree
+# Tab 3 • Feature Importance + Consensus Tree
 # ----------------------
-import os, json, hashlib
-import numpy as np
-import matplotlib.pyplot as plt
 from collections import defaultdict
-import streamlit as st
+import hashlib
+import itertools
 
 with tab3:
     st.header("📊 Feature Importance & Consensus Tree")
 
-    # 1️⃣  Pick importance metric
     metric_choice = st.radio(
         "Importance metric",
         ("Split frequency", "Rows handled"),
@@ -557,7 +444,6 @@ with tab3:
     with open(imp_file, "r") as f:
         imp_dict = json.load(f)
 
-    # ── Bar chart & table
     items = sorted(imp_dict.items(), key=lambda x: x[1], reverse=True)
     feats, imps = zip(*items) if items else ([], [])
     if len(imps) == 0:
@@ -573,80 +459,43 @@ with tab3:
             use_container_width=True,
         )
 
-    # 2️⃣  Consensus tree prerequisites
     if "X_test" not in st.session_state or "y_test" not in st.session_state:
         st.info("Train a model first to build the consensus tree.")
         st.stop()
 
     X_test = st.session_state["X_test"]
     y_test = st.session_state["y_test"]
-    feature_names = load_feature_names()  # must exist in your app
+    feature_names = load_feature_names()
     max_depth = st.slider("Consensus-tree max depth", 1, 6, 3)
 
-    # Utility: robust root detection + JSON-tree predictor
-    def _root_id(nodes_list):
-        nodes = {n["id"]: n for n in nodes_list}
-        child_ids = set()
-        for n in nodes_list:
-            if not n.get("is_leaf", False):
-                if n.get("left")  is not None: child_ids.add(n["left"])
-                if n.get("right") is not None: child_ids.add(n["right"])
-        # root is any node id that is never referenced as a child
-        for nid in nodes:
-            if nid not in child_ids:
-                return nid
-        # fallback: first node
-        return nodes_list[0]["id"]
-
-
-        # --- Robust JSON-tree helpers (handles different schemas) ---
+    # --- Helpers robust to JSON schema/dtypes ---
     def _is_leaf(n):
-        # explicit flags
         if n.get("is_leaf") is True or n.get("leaf") is True:
             return True
-        # structural leaf (no children)
         l = n.get("left", n.get("left_id"))
         r = n.get("right", n.get("right_id"))
         return (l in (None, "", -1)) and (r in (None, "", -1))
-    
+
     def _leaf_label(n):
-        """Return a string label for a leaf node under multiple possible schemas."""
-        # 1) Direct scalar fields
         for k in ("class", "label", "pred", "prediction", "yhat", "y", "target", "class_index"):
             if k in n and n[k] is not None and not isinstance(n[k], (list, dict)):
                 return str(n[k])
-    
-        # 2) Probabilities dict (your trees use this)
         for k in ("probabilities", "proba", "prob", "probs"):
-            if k in n and n[k] is not None:
-                probs = n[k]
-                if isinstance(probs, dict) and len(probs):
-                    # argmax by value
-                    return str(max(probs.items(), key=lambda kv: kv[1])[0])
-    
-        # 3) Class counts/histograms
+            if k in n and n[k] is not None and isinstance(n[k], dict) and len(n[k]):
+                return str(max(n[k].items(), key=lambda kv: kv[1])[0])
         for k in ("counts", "class_counts", "hist", "class_hist", "n_class", "counts_per_class"):
-            if k in n and n[k] is not None:
-                v = n[k]
-                if isinstance(v, dict) and len(v):
-                    return str(max(v.items(), key=lambda kv: kv[1])[0])
-    
-        # Fallback
+            if k in n and n[k] is not None and isinstance(n[k], dict) and len(n[k]):
+                return str(max(n[k].items(), key=lambda kv: kv[1])[0])
         return "NA"
 
     def _feature_threshold(n):
-        """Pull (feature, threshold) tolerating alternate key names."""
         f = n.get("feature", n.get("feat", n.get("feature_index", n.get("split_feature"))))
         t = n.get("threshold", n.get("thr", n.get("split_threshold", n.get("value"))))
-        if f is None or t is None:
-            raise KeyError("Missing feature/threshold in node.")
-        # ensure scalar
         if isinstance(t, (list, tuple, np.ndarray)):
             t = float(t[0])
         return int(f), float(t)
 
     def _node_map_and_root(nodes_list):
-        """Return (nodes_dict, root_id_str) with string IDs for consistency."""
         nodes = {}
         child_ids = set()
         for n in nodes_list:
@@ -657,43 +506,47 @@ with tab3:
                 r = n.get("right", n.get("right_id"))
                 if l is not None: child_ids.add(str(l))
                 if r is not None: child_ids.add(str(r))
-        # root = node never referenced as child
         for nid in nodes:
             if nid not in child_ids:
                 return nodes, nid
-        # fallback
         return nodes, next(iter(nodes))
 
+    def _col_as_float(xcol):
+        if np.issubdtype(xcol.dtype, np.number):
+            return xcol.astype(float)
+        return pd.to_numeric(xcol, errors="coerce").to_numpy()
 
     def predict_tree_json(tree, X):
         nodes, rid = _node_map_and_root(tree["nodes"])
         out = []
         for row in X:
             nid = rid
-            # descend until leaf
             while not _is_leaf(nodes[nid]):
                 node = nodes[nid]
                 f, thr = _feature_threshold(node)
-                nxt = node.get("left") if row[f] <= thr else node.get("right")
-                nid = str(nxt)
+                val = row[f]
+                try:
+                    v = float(val)
+                except Exception:
+                    v = np.nan
+                if np.isnan(v):
+                    # default to left if missing
+                    nid = str(node.get("left"))
+                else:
+                    nid = str(node.get("left")) if v <= thr else str(node.get("right"))
             out.append(_leaf_label(nodes[nid]))
         return np.array(out, dtype=str)
 
-
-    # Build votes once (predictions of each tree on X_test)
     tree_files = [f for f in os.listdir(MODELS_DIR) if f.startswith("tree_")]
     if len(tree_files) == 0:
         st.error("No trees found in the models directory.")
         st.stop()
 
-    ensemble   = [load_tree(int(f.split("_")[1].split(".")[0])) for f in tree_files]
-    V = np.vstack([predict_tree_json(t, X_test) for t in ensemble])   # shape [T, N]
+    ensemble = [load_tree(int(f.split("_")[1].split(".")[0])) for f in tree_files]
+    V = np.vstack([predict_tree_json(t, X_test) for t in ensemble])   # [T, N]
     T, N = V.shape
-
-    # Optional weights over trees (uniform here; plug in your SMC weights if you have them)
     w = np.ones(T, dtype=float)
 
-    # Majority label for each row j across trees (weighted)
     def per_row_majority(mask):
         cols = np.where(mask)[0]
         chosen = []
@@ -703,20 +556,16 @@ with tab3:
             chosen.append(vals[int(np.argmax(counts))])
         return np.array(chosen, dtype=str)
 
-    # Region-level majority label across all rows & trees (for leaf assignment)
     def region_majority(mask):
         cols = np.where(mask)[0]
         if len(cols) == 0:
             return "NA"
-        # accumulate counts per label across trees and selected rows
         label_counts = defaultdict(float)
         for j in cols:
             for i in range(T):
                 label_counts[V[i, j]] += w[i]
-        # pick argmax
         return max(label_counts.items(), key=lambda kv: kv[1])[0]
 
-    # Split selection: count how many rows reach each (feature, threshold) at a given depth
     def best_split(mask, depth_level):
         counts = defaultdict(int)
         if int(mask.sum()) == 0:
@@ -733,27 +582,25 @@ with tab3:
                     f, thr = _feature_threshold(node)
                     counts[(f, float(thr))] += int(m.sum())
                     continue
-                if not m.any():
-                    continue
+                # propagate masks safely
                 f, thr = _feature_threshold(node)
-                xcol = X_test[:, f]
-                lm = m & (xcol <= thr)
-                rm = m & (xcol >  thr)
+                col = _col_as_float(X_test[:, f])
+                valid = m & ~np.isnan(col)
+                if not valid.any():
+                    continue
+                lm = valid & (col <= thr)
+                rm = valid & (col >  thr)
                 if lm.any(): stack.append((str(node.get("left")),  lm, d+1))
                 if rm.any(): stack.append((str(node.get("right")), rm, d+1))
         return max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
 
-
-    # Hash inputs for cache keying (prevents stale results if data changes)
     x_hash = hashlib.md5(X_test.tobytes()).hexdigest()
     y_hash = hashlib.md5(y_test.astype(str).tobytes()).hexdigest()
     tree_sig = (len(ensemble),) + tuple(sorted(tree_files))
 
     @st.cache_data(show_spinner=False)
     def build_consensus(depth_cap, x_sig, y_sig, tree_signature):
-        # Recursion that uses ensemble votes only (no y_test leakage)
         def recurse(mask, depth):
-            # purity: if all per-row majorities agree, stop
             row_maj = per_row_majority(mask)
             uniq = np.unique(row_maj)
             if depth >= depth_cap or len(uniq) <= 1:
@@ -766,8 +613,14 @@ with tab3:
                 return {"leaf": True, "class": str(pred)}
 
             feat, thr = split
-            left_mask  = mask & (X_test[:, feat] <= thr)
-            right_mask = mask & (X_test[:, feat] >  thr)
+            col = _col_as_float(X_test[:, feat])
+            valid = mask & ~np.isnan(col)
+            if not valid.any():
+                pred = region_majority(mask)
+                return {"leaf": True, "class": str(pred)}
+
+            left_mask  = valid & (col <= thr)
+            right_mask = valid & (col >  thr)
             if not left_mask.any() or not right_mask.any():
                 pred = region_majority(mask)
                 return {"leaf": True, "class": str(pred)}
@@ -781,60 +634,51 @@ with tab3:
 
         tree_dict = recurse(np.ones(N, dtype=bool), 0)
 
-        # predict with built tree (evaluation uses y_test only here)
         def predict_one(row, node):
             while not node.get("leaf", False):
-                node = node["left"] if row[node["feature"]] <= node["threshold"] else node["right"]
+                f = node["feature"]; thr = node["threshold"]
+                try:
+                    v = float(row[f])
+                except Exception:
+                    v = np.nan
+                node = node["left"] if (not np.isnan(v) and v <= thr) else node["right"]
             return node["class"]
 
         preds = np.array([predict_one(r, tree_dict) for r in X_test], dtype=str)
         acc   = np.mean(preds == y_test.astype(str))
 
-        # leaf count
-        def count_leaves(node):
-            return 1 if node.get("leaf", False) else \
-                   count_leaves(node["left"]) + count_leaves(node["right"])
+        def count_leaves(n):
+            return 1 if n.get("leaf", False) else count_leaves(n["left"]) + count_leaves(n["right"])
 
         return tree_dict, acc, count_leaves(tree_dict)
 
     tree_dict, cons_acc, n_leaves = build_consensus(max_depth, x_hash, y_hash, tree_sig)
 
-    # 3️⃣  Graphviz render + accuracy
-    def to_dot(node, idx=None, lines=None):
-        if idx is None: idx = [0]
-        if lines is None:
-            lines = ["digraph G{", 'node [shape=box, style="rounded,filled"]']
-        this = idx[0]; idx[0] += 1
-        if node.get("leaf", False):
-            lines.append(
-                f'{this} [label="class = {node["class"]}", shape=oval, style=filled, fillcolor=lightgreen];'
-            )
-        else:
-            lab = f'{feature_names[node["feature"]]} ≤ {node["threshold"]:.2f}'
-            lines.append(
-                f'{this} [label="{lab}", style=filled, fillcolor=lightblue];'
-            )
+    # Proper Graphviz rendering of the whole consensus tree
+    def render_consensus_graph(node, feature_names):
+        dot = graphviz.Digraph()
+        counter = itertools.count(0)
 
-        #if node.get("leaf", False):
-        #    lines.append(f'{this} [label="class = {node["class"]}", shape=oval, fillcolor=lightgreen];')
-        #else:
-        #    lab = f'{feature_names[node["feature"]]} ≤ {node["threshold"]:.2f}'
-        #    lines.append(f'{this} [label="{lab}", fillcolor=lightblue];')
-        #    l_id = idx[0]; to_dot(node["left"], idx, lines); lines.append(f"{this} -> {l_id} [label=True];")
-        #    r_id = idx[0]; to_dot(node["right"], idx, lines); lines.append(f"{this} -> {r_id} [label=False];")
-        if this == 0:
-            lines.append("}")
-            return "\n".join(lines)
+        def add(n):
+            my_id = str(next(counter))
+            if n.get("leaf", False):
+                dot.node(my_id, f"class = {n['class']}", shape="oval", style="filled", fillcolor="lightgreen")
+                return my_id
+            lab = f"{feature_names[n['feature']]} ≤ {n['threshold']:.2f}"
+            dot.node(my_id, lab, shape="ellipse", style="filled", fillcolor="lightblue")
+            left_id = add(n["left"])
+            right_id = add(n["right"])
+            dot.edge(my_id, left_id, label="True")
+            dot.edge(my_id, right_id, label="False")
+            return my_id
 
-    st.graphviz_chart(to_dot(tree_dict))
+        add(node)
+        return dot
+
+    st.graphviz_chart(render_consensus_graph(tree_dict, feature_names))
     st.success(f"Consensus-tree accuracy on test set: **{cons_acc:.2%}**")
     st.caption(f"{len(ensemble)} trees • depth cap {max_depth} • leaves {n_leaves}")
 
-
-
-# ----------------------
-# Tab 4: Interactive Prediction (Exclude "Target")
-# ----------------------
 # ----------------------
 # Tab 4: Interactive Prediction (Simplified & Improved Voting)
 # ----------------------
@@ -845,8 +689,6 @@ with tab4:
     feature_names_for_prediction = [name for name in all_feature_names if name.lower() != "target"]
 
     st.subheader("📝 Enter Input Values for Features")
-
-    # Use a compact input table
     input_df = pd.DataFrame([[0.0] * len(feature_names_for_prediction)], columns=feature_names_for_prediction)
     edited_df = st.data_editor(input_df, use_container_width=True, key="input_table")
     input_values = edited_df.iloc[0].tolist()
@@ -865,16 +707,16 @@ with tab4:
 
             if st.button("🔍 Predict with Selected Tree"):
                 pred_probs, path = predict_from_tree(tree_data, input_values)
-                predicted_class = max(pred_probs, key=pred_probs.get)
-                confidence = pred_probs[predicted_class]
-
-                st.success(f"**Predicted Class:** `{predicted_class}`  \n**Confidence:** `{confidence:.2%}`")
-
-                st.subheader("Class Probabilities")
-                st.dataframe(pd.DataFrame.from_dict(pred_probs, orient="index", columns=["Probability (%)"]).applymap(lambda x: round(x * 100, 2)))
-
-                st.subheader("Tree Path Highlight")
-                st.graphviz_chart(visualize_tree_with_path(tree_data, all_feature_names, path))
+                if pred_probs:
+                    predicted_class = max(pred_probs, key=pred_probs.get)
+                    confidence = pred_probs[predicted_class]
+                    st.success(f"**Predicted Class:** `{predicted_class}`  \n**Confidence:** `{confidence:.2%}`")
+                    st.subheader("Class Probabilities")
+                    st.dataframe(pd.DataFrame.from_dict(pred_probs, orient="index", columns=["Probability (%)"]).applymap(lambda x: round(x * 100, 2)))
+                    st.subheader("Tree Path Highlight")
+                    st.graphviz_chart(visualize_tree_with_path(tree_data, all_feature_names, path))
+                else:
+                    st.error("Prediction failed for the selected tree.")
 
     elif mode == "Ensemble":
         if st.button("🔎 Predict with Ensemble"):
@@ -887,27 +729,23 @@ with tab4:
                     tree_id = int(file.split("_")[1].split(".")[0])
                     tree_data = load_tree(tree_id)
                     pred_probs, _ = predict_from_tree(tree_data, input_values)
-                    top_class = max(pred_probs, key=pred_probs.get)
-                    vote_counter[top_class] = vote_counter.get(top_class, 0) + 1
+                    if pred_probs:
+                        top_class = max(pred_probs, key=pred_probs.get)
+                        vote_counter[top_class] = vote_counter.get(top_class, 0) + 1
 
-                total_votes = sum(vote_counter.values())
+                total_votes = sum(vote_counter.values()) or 1
                 vote_probabilities = {cls: count / total_votes for cls, count in vote_counter.items()}
                 predicted_class = max(vote_probabilities.items(), key=lambda x: x[1])[0]
 
                 st.success(f"**Ensemble Predicted Class:** `{predicted_class}`")
-
                 st.subheader("Class Probabilities Based on Voting")
                 st.dataframe(pd.DataFrame.from_dict(vote_probabilities, orient="index", columns=["Vote Share (%)"]).applymap(lambda x: round(x * 100, 2)))
-
                 st.subheader("Raw Vote Count")
                 st.json(vote_counter)
-
 
 # ----------------------
 # Tab 5: Overall Performance Analysis
 # ----------------------
-from streamlit_plotly_events import plotly_events
-
 with tab5:
     st.header("Overall Performance Analysis")
 
@@ -915,7 +753,6 @@ with tab5:
     if not tree_files:
         st.warning("No tree JSON files found. Please train your model first.")
     else:
-        # Load stats
         stats_list = []
         for filename in tree_files:
             try:
@@ -935,7 +772,6 @@ with tab5:
 
         df_stats = pd.DataFrame(stats_list).sort_values("Tree ID")
 
-        # Plot
         fig = px.scatter(
             df_stats,
             x="Nodes",
@@ -946,16 +782,11 @@ with tab5:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Selectbox to show a tree
-        selected_id = st.selectbox(
-            "Select a Tree to Visualize",
-            df_stats["Tree ID"].astype(str)
-        )
+        selected_id = st.selectbox("Select a Tree to Visualize", df_stats["Tree ID"].astype(str))
         selected_tree = load_tree(int(selected_id))
         feature_names = load_feature_names()
         st.graphviz_chart(visualize_tree(selected_tree, feature_names))
 
-        # Ensemble accuracy
         if "X_test" in st.session_state and "y_test" in st.session_state:
             X_test = st.session_state["X_test"]
             y_test = st.session_state["y_test"]
@@ -966,16 +797,16 @@ with tab5:
                 for tree_id in df_stats["Tree ID"]:
                     tree_data = load_tree(tree_id)
                     pred_probs, _ = predict_from_tree(tree_data, list(x))
-                    pred_label = max(pred_probs.items(), key=lambda p: p[1])[0]
-                    votes.append(pred_label)
-                majority = max(set(votes), key=votes.count)
+                    if pred_probs:
+                        pred_label = max(pred_probs.items(), key=lambda p: p[1])[0]
+                        votes.append(pred_label)
+                majority = max(set(votes), key=votes.count) if votes else "?"
                 ensemble_predictions.append(majority)
 
             ensemble_accuracy = np.mean([str(p) == str(t) for p, t in zip(ensemble_predictions, y_test)])
         else:
             ensemble_accuracy = None
 
-        # Summary
         if ensemble_accuracy is not None:
             st.markdown(f"""
             - **Ensemble (Majority Voting) Accuracy:** {ensemble_accuracy:.2%}  
@@ -990,105 +821,6 @@ with tab5:
             - **Average Number of Nodes:** {df_stats['Nodes'].mean():.2f}  
             - **Average Number of Leaves:** {df_stats['Leaves'].mean():.2f}  
             """)
-
-
-
-# with tab5:
-#     st.header("Overall Performance Analysis")
-
-#     tree_files = get_valid_tree_files()
-#     if not tree_files:
-#         st.warning("No tree JSON files found. Please train your model first.")
-#     else:
-#         # Extract statistics
-#         accuracies, depths, num_nodes, num_leaves, tree_labels, tree_ids = [], [], [], [], [], []
-#         for filename in tree_files:
-#             with open(os.path.join(MODELS_DIR, filename), "r") as file:
-#                 data = json.load(file)
-#                 stats = data.get("stats", {})
-#                 tree_id = int(filename.replace("tree_", "").replace(".json", ""))
-#                 tree_ids.append(tree_id)
-#                 tree_labels.append(f"Tree {tree_id}")
-#                 accuracies.append(stats.get("accuracy", np.nan))
-#                 depths.append(stats.get("max_depth", np.nan))
-#                 num_nodes.append(stats.get("num_nodes", np.nan))
-#                 num_leaves.append(stats.get("num_leaves", np.nan))
-
-#         # DataFrame for plotting
-#         performance_df = pd.DataFrame({
-#             "Tree": tree_labels,
-#             "Accuracy": accuracies,
-#             "Depth": depths,
-#             "Nodes": num_nodes,
-#             "Leaves": num_leaves,
-#             "Tree_ID": tree_ids
-#         })
-
-#         # Interactive scatter plot
-#         fig = px.scatter(
-#             performance_df,
-#             x="Nodes",
-#             y="Accuracy",
-#             hover_data=["Tree", "Depth", "Leaves"],
-#             labels={"Nodes": "Tree Size (Number of Nodes)", "Accuracy": "Accuracy"},
-#             title="Tree Accuracy vs. Tree Size",
-#             custom_data=["Tree_ID"]
-#         )
-
-#         fig.update_layout(
-#             xaxis_title="Tree Size (Number of Nodes)",
-#             yaxis_title="Accuracy",
-#             hovermode="closest"
-#         )
-
-#         # Capture click event
-#         selected_point = st.plotly_chart(fig, use_container_width=True, click_event=True)
-
-#         if selected_point:
-#             clicked_points = selected_point.get("points", [])
-#             if clicked_points:
-#                 clicked_tree_id = clicked_points[0]["customdata"][0]
-#                 st.subheader(f"Visualization of Tree {clicked_tree_id}")
-#                 tree_data = load_tree(clicked_tree_id)
-#                 if tree_data:
-#                     feature_names = load_feature_names()
-#                     st.graphviz_chart(visualize_tree(tree_data, feature_names))
-#                 else:
-#                     st.error(f"Tree {clicked_tree_id} data could not be loaded.")
-#         else:
-#             st.info("Click a dot in the plot above to visualize the corresponding tree.")
-
-#         # Compute ensemble majority-vote accuracy
-#         if "X_test" in st.session_state and "y_test" in st.session_state:
-#             X_test = st.session_state["X_test"]
-#             y_test = st.session_state["y_test"]
-
-#             ensemble_predictions = []
-#             for x in X_test:
-#                 preds = []
-#                 for tree_id in tree_ids:
-#                     tree_data = load_tree(tree_id)
-#                     pred_probs, _ = predict_from_tree(tree_data, list(x))
-#                     # Get prediction class with highest probability
-#                     pred_class = max(pred_probs.items(), key=lambda item: item[1])[0]
-#                     preds.append(pred_class)
-#                 # Majority vote
-#                 final_pred = max(set(preds), key=preds.count)
-#                 ensemble_predictions.append(final_pred)
-
-#             ensemble_accuracy = np.mean([pred == str(y_true) for pred, y_true in zip(ensemble_predictions, y_test)])
-
-#             st.subheader("Summary Statistics")
-#             st.markdown(f"""
-#             - **Ensemble (Majority Voting) Accuracy:** {ensemble_accuracy:.2%}
-#             - **Average Max Depth:** {performance_df['Depth'].mean():.2f}
-#             - **Average Number of Nodes:** {performance_df['Nodes'].mean():.2f}
-#             - **Average Number of Leaves:** {performance_df['Leaves'].mean():.2f}
-#             """)
-#         else:
-#             st.warning("Test data not found. Retrain the model (Tab 0) to generate test data for ensemble accuracy.")
-
-
 
 # ----------------------
 # Tab 6: Robustness Analysis
@@ -1163,34 +895,33 @@ with tab6:
             st.write(f"Class {cls}: Mean = {np.mean(results[cls]):.2f}, Std = {np.std(results[cls]):.2f}")
     else:
         st.write("No predictions generated.")
-        
+
 # ----------------------
 # Tab 7: Statistical Tests
 # ----------------------
-import pandas as pd
-import numpy as np
-from scipy.stats import ttest_ind, ttest_rel, f_oneway
-import statsmodels.api as sm
-import statsmodels.formula.api as smf
-
-with  tab7:
-   
+with tab7:
     st.header("Statistical Tests")
     st.write("Upload a CSV file for running statistical tests on your data.")
-    
-    # Upload CSV file
     uploaded_stat_file = st.file_uploader("Choose a CSV file", type=["csv"], key="stat_tests_file")
-    
     if uploaded_stat_file is not None:
         df_stat = pd.read_csv(uploaded_stat_file)
         df_stat = df_stat.dropna()
         st.write("Dataset Preview:")
         st.dataframe(df_stat.head(10))
-        
-        # Choose the statistical test
+
+        from scipy.stats import ttest_ind, ttest_rel, f_oneway
+        # Try optional statsmodels (may not be available in all deployments)
+        try:
+            import statsmodels.api as sm
+            import statsmodels.formula.api as smf
+            sm_ok = True
+        except Exception as e:
+            sm_ok = False
+            sm_err = e
+
         test_type = st.selectbox("Select Statistical Test", 
                                   ["Independent t-test", "Paired t-test", "One-way ANOVA", "ANCOVA"])
-        
+
         if test_type == "Independent t-test":
             st.markdown("#### Independent t-test")
             st.write("Select a numeric variable and a grouping (categorical) variable with exactly 2 groups.")
@@ -1205,7 +936,7 @@ with  tab7:
                     data2 = df_stat[df_stat[group_col] == groups[1]][numeric_col].dropna()
                     stat, p = ttest_ind(data1, data2)
                     st.write(f"t-test statistic: {stat:.3f}, p-value: {p:.3f}")
-        
+
         elif test_type == "Paired t-test":
             st.markdown("#### Paired t-test")
             st.write("Select two numeric columns that represent paired measurements.")
@@ -1214,12 +945,12 @@ with  tab7:
             if st.button("Run Paired t-test", key="run_paired_ttest"):
                 data1 = df_stat[col1].dropna()
                 data2 = df_stat[col2].dropna()
-                if len(data1) != len(data2):
+                if len(data1) != len(data2]):
                     st.error("The two columns must have the same number of observations for a paired t-test.")
                 else:
                     stat, p = ttest_rel(data1, data2)
                     st.write(f"Paired t-test statistic: {stat:.3f}, p-value: {p:.3f}")
-        
+
         elif test_type == "One-way ANOVA":
             st.markdown("#### One-way ANOVA")
             st.write("Select a numeric variable and a categorical grouping variable with 3 or more groups.")
@@ -1233,83 +964,69 @@ with  tab7:
                     group_data = [df_stat[df_stat[group_col] == grp][numeric_col].dropna() for grp in groups]
                     stat, p = f_oneway(*group_data)
                     st.write(f"ANOVA F-statistic: {stat:.3f}, p-value: {p:.3f}")
-        
+
         elif test_type == "ANCOVA":
             st.markdown("#### ANCOVA")
-            st.write("Select a dependent (numeric) variable, a categorical factor, and a continuous covariate.")
-            dep_var = st.selectbox("Select Dependent Variable", df_stat.columns, key="ancova_dep")
-            factor = st.selectbox("Select Categorical Factor", df_stat.columns, key="ancova_factor")
-            covariate = st.selectbox("Select Continuous Covariate", df_stat.columns, key="ancova_cov")
-            if st.button("Run ANCOVA", key="run_ancova"):
-                formula = f"{dep_var} ~ C({factor}) + {covariate}"
-                model = smf.ols(formula, data=df_stat).fit()
-                anova_table = sm.stats.anova_lm(model, typ=2)
-                st.write("ANCOVA results:")
-                st.dataframe(anova_table)
+            if not sm_ok:
+                st.warning(f"statsmodels not available for ANCOVA. ({sm_err})")
+            else:
+                st.write("Select a dependent (numeric) variable, a categorical factor, and a continuous covariate.")
+                dep_var = st.selectbox("Select Dependent Variable", df_stat.columns, key="ancova_dep")
+                factor = st.selectbox("Select Categorical Factor", df_stat.columns, key="ancova_factor")
+                covariate = st.selectbox("Select Continuous Covariate", df_stat.columns, key="ancova_cov")
+                if st.button("Run ANCOVA", key="run_ancova"):
+                    formula = f"{dep_var} ~ C({factor}) + {covariate}"
+                    model = smf.ols(formula, data=df_stat).fit()
+                    anova_table = sm.stats.anova_lm(model, typ=2)
+                    st.write("ANCOVA results:")
+                    st.dataframe(anova_table)
 
 # ----------------------
-# Tab 7: Custom Plotting
+# Tab 8: Custom Plotting
 # ----------------------
-import pandas as pd
-import matplotlib.pyplot as plt
-
 with tab8:
     st.header("Custom Plotting")
     st.write("Upload a CSV file or use an existing one to plot your features.")
 
-    # File uploader for plotting dataset.
     uploaded_plot_file = st.file_uploader("Choose a CSV file for plotting", type=["csv"], key="plot_file")
-    
     if uploaded_plot_file is not None:
-        df_plot = pd.read_csv(uploaded_plot_file)
-        df_plot = df_plot.dropna()  # Optional: remove missing values
+        df_plot = pd.read_csv(uploaded_plot_file).dropna()
         st.dataframe(df_plot.head(10))
-        
-        # Choose a plot type
+
         plot_type = st.selectbox("Select Plot Type", ["Scatter Plot", "Line Plot", "Bar Plot", "Histogram"], key="plot_type")
-        
-        # Based on the plot type, choose which columns to plot
+
         if plot_type in ["Scatter Plot", "Line Plot", "Bar Plot"]:
             x_col = st.selectbox("Select X-axis Feature", df_plot.columns, key="plot_x")
             y_col = st.selectbox("Select Y-axis Feature", df_plot.columns, key="plot_y")
         elif plot_type == "Histogram":
             col = st.selectbox("Select Feature for Histogram", df_plot.columns, key="plot_hist")
             bins = st.slider("Number of bins", min_value=5, max_value=100, value=20)
-        
-        # Create the plot
+
         fig, ax = plt.subplots()
         if plot_type == "Scatter Plot":
-            ax.scatter(df_plot[x_col], df_plot[y_col], color="dodgerblue")
-            ax.set_xlabel(x_col)
-            ax.set_ylabel(y_col)
-            ax.set_title(f"Scatter Plot: {x_col} vs {y_col}")
+            ax.scatter(df_plot[x_col], df_plot[y_col])
+            ax.set_xlabel(x_col); ax.set_ylabel(y_col); ax.set_title(f"Scatter Plot: {x_col} vs {y_col}")
         elif plot_type == "Line Plot":
-            ax.plot(df_plot[x_col], df_plot[y_col], marker="o", linestyle="-", color="darkorange")
-            ax.set_xlabel(x_col)
-            ax.set_ylabel(y_col)
-            ax.set_title(f"Line Plot: {x_col} vs {y_col}")
+            ax.plot(df_plot[x_col], df_plot[y_col], marker="o", linestyle="-")
+            ax.set_xlabel(x_col); ax.set_ylabel(y_col); ax.set_title(f"Line Plot: {x_col} vs {y_col}")
         elif plot_type == "Bar Plot":
-            ax.bar(df_plot[x_col], df_plot[y_col], color="mediumseagreen")
-            ax.set_xlabel(x_col)
-            ax.set_ylabel(y_col)
-            ax.set_title(f"Bar Plot: {x_col} vs {y_col}")
+            ax.bar(df_plot[x_col], df_plot[y_col])
+            ax.set_xlabel(x_col); ax.set_ylabel(y_col); ax.set_title(f"Bar Plot: {x_col} vs {y_col}")
         elif plot_type == "Histogram":
-            ax.hist(df_plot[col], bins=bins, edgecolor="black", color="orchid")
-            ax.set_xlabel(col)
-            ax.set_ylabel("Frequency")
-            ax.set_title(f"Histogram of {col}")
-        
+            ax.hist(df_plot[col], bins=bins, edgecolor="black")
+            ax.set_xlabel(col); ax.set_ylabel("Frequency"); ax.set_title(f"Histogram of {col}")
+
         plt.tight_layout()
         st.pyplot(fig)
     else:
         st.info("Please upload a CSV file to create plots.")
 
-# --- Evaluation Metrics Tab ---
-# --- Evaluation Metrics Tab (ROC, AUC & Confusion Matrix) ---
+# ----------------------
+# Tab 9: Evaluation Metrics (ROC, AUC & Confusion Matrix)
+# ----------------------
 with tab9:
     st.header("Evaluation Metrics (ROC, AUC & Confusion Matrix)")
 
-    # Must have cached test data
     if "X_test" not in st.session_state or "y_test" not in st.session_state:
         st.error("Test data not found. Please train the model first (Tab 0).")
         st.stop()
@@ -1317,7 +1034,6 @@ with tab9:
     X_test = st.session_state["X_test"]
     y_test = st.session_state["y_test"]
 
-    # Build a fresh local mapping of trees for this tab
     tree_files = get_valid_tree_files()
     label_to_tree_id_eval = {}
     for filename in sorted(tree_files):
@@ -1338,20 +1054,16 @@ with tab9:
         st.error("No tree models found. Please train the model first in the 'Train SMC Model' tab.")
         st.stop()
 
-    # Evaluation mode selection
     eval_mode = st.radio("Prediction Mode", options=["Single Tree", "Ensemble"], horizontal=True, key="eval_mode")
 
-    # For binary ROC, align types to strings so '1' matches '1'
     y_true_str = y_test.astype(str)
     unique_classes = np.unique(y_true_str)
     is_binary = len(unique_classes) == 2
-    # Choose the positive class consistently (the lexicographically larger label, typically "1")
     pos_label_str = unique_classes[-1] if is_binary else None
 
-    y_scores = []              # probability for positive class (for ROC, binary only)
-    y_pred_labels_str = []     # predicted class labels (as strings) for confusion matrix
+    y_scores = []
+    y_pred_labels_str = []
 
-    # Helper: argmax over a probability dict that may have string keys
     def argmax_label(prob_dict: dict) -> str:
         return max(prob_dict.items(), key=lambda kv: kv[1])[0] if prob_dict else "?"
 
@@ -1367,9 +1079,7 @@ with tab9:
                 y_scores.append(float(pred_probs.get(pos_label_str, 0.0)))
 
     else:  # Ensemble
-        # Average probabilities (for ROC) and majority vote (for confusion matrix)
         all_tree_ids = [label_to_tree_id_eval[k] for k in label_to_tree_id_eval.keys()]
-
         for row in X_test:
             per_tree_probs = []
             votes = []
@@ -1378,27 +1088,16 @@ with tab9:
                 probs, _ = predict_from_tree(td, list(row))
                 per_tree_probs.append(probs)
                 votes.append(argmax_label(probs))
-
-            # Majority vote for predicted label
-            if votes:
-                majority = max(set(votes), key=votes.count)
-            else:
-                majority = "?"
+            majority = max(set(votes), key=votes.count) if votes else "?"
             y_pred_labels_str.append(majority)
-
-            # For ROC: average positive-class probability
             if is_binary:
-                # collect per-tree prob for pos label
                 cls_probs = [float(p.get(pos_label_str, 0.0)) for p in per_tree_probs] if per_tree_probs else [0.0]
                 y_scores.append(float(np.mean(cls_probs)))
 
-    # ----- Confusion Matrix -----
+    # Confusion Matrix
     st.subheader("Confusion Matrix")
-
-    # Establish consistent label order (union of true and predicted)
     labels_all = sorted(np.unique(np.concatenate([unique_classes, np.array(y_pred_labels_str, dtype=str)])))
     from sklearn.metrics import confusion_matrix, classification_report
-
     cm = confusion_matrix(y_true_str, np.array(y_pred_labels_str, dtype=str), labels=labels_all)
 
     normalize = st.checkbox("Normalize rows to percentage", value=False, help="Show each row as proportions of the true class total.")
@@ -1408,7 +1107,6 @@ with tab9:
         row_sums[row_sums == 0] = 1.0
         cm_to_show = (cm_to_show / row_sums) * 100.0
 
-    # Plot heatmap with matplotlib (no seaborn)
     fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
     im = ax_cm.imshow(cm_to_show, cmap="Blues")
     ax_cm.set_xticks(range(len(labels_all)))
@@ -1418,7 +1116,6 @@ with tab9:
     ax_cm.set_xlabel("Predicted label")
     ax_cm.set_ylabel("True label")
     ax_cm.set_title("Confusion Matrix" + (" (%)" if normalize else " (counts)"))
-    # annotate cells
     for i in range(cm_to_show.shape[0]):
         for j in range(cm_to_show.shape[1]):
             val = cm_to_show[i, j]
@@ -1427,7 +1124,6 @@ with tab9:
     plt.tight_layout()
     st.pyplot(fig_cm)
 
-    # Optional summary metrics (precision/recall/F1) for multiclass too
     with st.expander("Show classification report"):
         try:
             report = classification_report(y_true_str, np.array(y_pred_labels_str, dtype=str), labels=labels_all, zero_division=0, output_dict=False)
@@ -1435,7 +1131,7 @@ with tab9:
         except Exception as e:
             st.write("Could not compute classification report:", e)
 
-    # ----- ROC & AUC (binary only) -----
+    # ROC & AUC (binary only)
     st.subheader("ROC & AUC")
     if not is_binary:
         st.info("ROC/AUC shown only for binary problems. Detected classes: " + ", ".join(map(str, unique_classes)))
@@ -1443,22 +1139,14 @@ with tab9:
         if not y_scores:
             st.warning("No probability scores available for ROC.")
         else:
-            from sklearn.metrics import roc_curve, auc
             fpr, tpr, thresholds = roc_curve(y_true_str, np.array(y_scores, dtype=float), pos_label=pos_label_str)
             roc_auc = auc(fpr, tpr)
             st.write(f"ROC AUC: {roc_auc:.3f}")
-
             fig, ax = plt.subplots()
             ax.plot(fpr, tpr, lw=2, label=f"ROC (AUC = {roc_auc:.2f})")
             ax.plot([0, 1], [0, 1], lw=1.5, linestyle="--")
-            ax.set_xlim([0.0, 1.0])
-            ax.set_ylim([0.0, 1.05])
-            ax.set_xlabel("False Positive Rate")
-            ax.set_ylabel("True Positive Rate")
+            ax.set_xlim([0.0, 1.0]); ax.set_ylim([0.0, 1.05])
+            ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
             ax.set_title("Receiver Operating Characteristic")
             ax.legend(loc="lower right")
             st.pyplot(fig)
-
-
-
-
