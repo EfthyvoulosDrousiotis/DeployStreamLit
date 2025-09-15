@@ -512,9 +512,29 @@ with tab3:
         return nodes, next(iter(nodes))
 
     def _col_as_float(xcol):
-        if np.issubdtype(xcol.dtype, np.number):
-            return xcol.astype(float)
-        return pd.to_numeric(xcol, errors="coerce").to_numpy()
+        """
+        Robustly coerce a 1-D column to float dtype.
+        Works for numeric, object, mixed, None, '', '?', etc.
+        """
+        arr = np.asarray(xcol, dtype=object)
+        out = np.empty(arr.shape[0], dtype=float)
+        for i, v in enumerate(arr):
+            if v is None:
+                out[i] = np.nan
+                continue
+            try:
+                out[i] = float(v)
+            except Exception:
+                s = str(v).strip()
+                if s in ("", "nan", "NaN", "None", "?"):
+                    out[i] = np.nan
+                else:
+                    try:
+                        out[i] = float(s)
+                    except Exception:
+                        out[i] = np.nan
+        return out
+
 
     def predict_tree_json(tree, X):
         nodes, rid = _node_map_and_root(tree["nodes"])
@@ -524,18 +544,25 @@ with tab3:
             while not _is_leaf(nodes[nid]):
                 node = nodes[nid]
                 f, thr = _feature_threshold(node)
+                # --- guard
+                if f < 0 or f >= len(row):
+                    # if feature index is invalid, fallback to majority leaf-ish behavior
+                    break
                 val = row[f]
                 try:
                     v = float(val)
                 except Exception:
                     v = np.nan
                 if np.isnan(v):
-                    # default to left if missing
                     nid = str(node.get("left"))
                 else:
                     nid = str(node.get("left")) if v <= thr else str(node.get("right"))
-            out.append(_leaf_label(nodes[nid]))
+                if nid not in nodes:  # extra safety
+                    break
+            # if we broke out early, pick current node’s best label
+            out.append(_leaf_label(nodes.get(nid, list(nodes.values())[0])))
         return np.array(out, dtype=str)
+
 
     tree_files = [f for f in os.listdir(MODELS_DIR) if f.startswith("tree_")]
     if len(tree_files) == 0:
@@ -580,10 +607,16 @@ with tab3:
                     continue
                 if d == depth_level:
                     f, thr = _feature_threshold(node)
+                    # --- guard: feature index out of range
+                    if f < 0 or f >= X_test.shape[1]:
+                        continue
                     counts[(f, float(thr))] += int(m.sum())
                     continue
-                # propagate masks safely
+    
                 f, thr = _feature_threshold(node)
+                # --- guard: feature index out of range
+                if f < 0 or f >= X_test.shape[1]:
+                    continue
                 col = _col_as_float(X_test[:, f])
                 valid = m & ~np.isnan(col)
                 if not valid.any():
@@ -593,6 +626,7 @@ with tab3:
                 if lm.any(): stack.append((str(node.get("left")),  lm, d+1))
                 if rm.any(): stack.append((str(node.get("right")), rm, d+1))
         return max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
+
 
     x_hash = hashlib.md5(X_test.tobytes()).hexdigest()
     y_hash = hashlib.md5(y_test.astype(str).tobytes()).hexdigest()
@@ -1150,4 +1184,5 @@ with tab9:
             ax.set_title("Receiver Operating Characteristic")
             ax.legend(loc="lower right")
             st.pyplot(fig)
+
 
