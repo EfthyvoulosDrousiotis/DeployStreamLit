@@ -945,7 +945,7 @@ with tab7:
             if st.button("Run Paired t-test", key="run_paired_ttest"):
                 data1 = df_stat[col1].dropna()
                 data2 = df_stat[col2].dropna()
-                if len(data1) != len(data2]):
+                if len(data1) != len(data2):
                     st.error("The two columns must have the same number of observations for a paired t-test.")
                 else:
                     stat, p = ttest_rel(data1, data2)
@@ -1150,3 +1150,4 @@ with tab9:
             ax.set_title("Receiver Operating Characteristic")
             ax.legend(loc="lower right")
             st.pyplot(fig)
+
