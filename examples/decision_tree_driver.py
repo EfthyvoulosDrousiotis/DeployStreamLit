@@ -131,7 +131,7 @@ def train_smc_model(
     num_iterations,
     num_trees,
     resampling_scheme,
-    random_state=42,
+    random_state=2,
 ):
     """
     Train an SMC ensemble and save:
